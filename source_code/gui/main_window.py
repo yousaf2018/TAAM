@@ -8,6 +8,7 @@ from workers.splitter_worker import SplitterWorker
 from workers.arena_processor import ArenaWorker
 from gui.tracking_popup import AdvancedTrackingPopup
 from utils.stream_logger import StreamRedirector
+from ui.analysis_module import AnalysisModule
 
 class TAAMMainWindow(QMainWindow):
     def __init__(self):
@@ -118,6 +119,11 @@ class TAAMMainWindow(QMainWindow):
         am_lay.addWidget(self._btn("📂 Load Annotations File", self.load_project_annotations))
         ann_mgmt_group.setLayout(am_lay)
         side_lay.addWidget(ann_mgmt_group)
+
+        # Create the button in the Sidebar side_lay
+        self.btn_behavior_analysis = self._btn("📉 Behavioral Endpoints", self.open_behavior_analysis)
+        side_lay.addWidget(self.btn_behavior_analysis)
+
         # --- MAIN TABS ---
         content = QVBoxLayout(); content.setContentsMargins(15,15,15,15)
         self.tabs = QTabWidget(); self.tabs.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -269,7 +275,7 @@ class TAAMMainWindow(QMainWindow):
         if idx >= 0: self.video_ui.set_current_class(idx)
 
     def add_videos(self):
-        ps, _ = QFileDialog.getOpenFileNames(self, "Add", "", "Videos (*.mp4 *.avi)")
+        ps, _ = QFileDialog.getOpenFileNames(self, "Add", "", "Videos (*.mp4 *.avi *.MP4 *.MOV)")
         for p in ps:
             if p not in self.video_data: cap = cv2.VideoCapture(p); self.video_data[p] = int(cap.get(7)); cap.release(); self.list_vids.addItem(p)
         if ps: self.list_vids.setCurrentRow(self.list_vids.count()-1)
@@ -292,28 +298,29 @@ class TAAMMainWindow(QMainWindow):
 
     def load_preview(self, row):
         if row < 0: return
-        # 1. Update current path and metadata
         self.current_video = self.list_vids.item(row).text()
+        
         cap = cv2.VideoCapture(self.current_video)
-        total = int(cap.get(7))
+        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         self.slider.setRange(0, total - 1)
         
-        # 2. SYNC: Pull annotations from global storage for this specific video
+        # Ensure the video has a dictionary entry in project_annotations
         if self.current_video not in self.project_annotations:
             self.project_annotations[self.current_video] = {}
         
+        # Link the Widget's annotations directly to the main storage
         self.video_ui.annotations = self.project_annotations[self.current_video]
         
-        # 3. Refresh Visuals
         ret, f = cap.read()
-        self.video_ui.set_current_frame(0, f)
-        self.roi_designer.set_frame(f)
+        if ret:
+            self.video_ui.set_current_frame(0, f)
+            self.roi_designer.set_frame(f)
         cap.release()
         
-        # 4. Update Stats and UI Labels
         self.on_ann_change() 
         self.lbl_frame_info.setText(f"Frame: 0 / {total}")
-        self.video_ui.update() # Force redraw of boxes
+        self.video_ui.update()
+    
     def seek(self, val):
         if not hasattr(self, 'current_video'): return
         cap = cv2.VideoCapture(self.current_video); cap.set(1, val); ret, f = cap.read(); self.video_ui.set_current_frame(val, f); self.roi_designer.set_frame(f); cap.release(); self.lbl_frame_info.setText(f"Frame: {val} / {self.video_data.get(self.current_video, 0)}")
@@ -328,7 +335,7 @@ class TAAMMainWindow(QMainWindow):
             missing = [os.path.basename(v) for v in vids if not any(len(b)>0 for b in self.project_annotations.get(v, {}).values())]
             if missing: QMessageBox.critical(self, "Audit", f"Unannotated:\n" + "\n".join(missing)); return
         classes = [c.strip() for c in self.edit_classes.text().split(',')]
-        config = {"task_type": self.combo_task.currentText(),"bbox_mode": self.combo_bbox_mode.currentText(),"fixed_bbox_size": self.spin_fixed_bbox.value(), "yolo_ver": self.combo_yolo_ver.currentText(), "custom_weights": self.edit_weights.text(), "epochs": self.spin_epochs.value(), "yolo_batch": self.spin_batch_yolo.value(), "imgsz": self.spin_imgsz.value(), "max_frames": self.spin_max.value(), "tr": 70, "va": 20, "chunk_duration": 5, "sam_batch": 16, "class_names": classes}
+        config = {"task_type": self.combo_task.currentText(),"bbox_mode": self.combo_bbox_mode.currentText(),"fixed_bbox_size": self.spin_fixed_bbox.value(), "yolo_ver": self.combo_yolo_ver.currentText(), "custom_weights": self.edit_weights.text(), "epochs": self.spin_epochs.value(), "yolo_batch": self.spin_batch_yolo.value(), "imgsz": self.spin_imgsz.value(), "max_frames": self.spin_max.value(), "tr": 70, "va": 20, "chunk_duration": 5, "sam_batch": self.spin_sam_batch.value(), "class_names": classes}
         self.btn_run_full.setEnabled(False); self.btn_stop.setEnabled(True); self.log_app.clear()
         self.worker = TAAMWorker(vids, self.project_annotations, self.workspace, self.edit_train_name.text(), config, mode)
         self.worker.log_app_signal.connect(self.log_app.append); self.worker.progress_signal.connect(lambda v, m: (self.prog_bar.setValue(v), self.log_app.append(f"STATUS: {m}")))
@@ -391,53 +398,53 @@ class TAAMMainWindow(QMainWindow):
             self.log_app.append(f"✅ SYSTEM: Annotations exported to {os.path.basename(file_path)}")
 
     def load_project_annotations(self):
-        """Loads annotations from JSON and maps them to currently loaded videos."""
+        """Loads and converts JSON data strictly to prevent Core Dump."""
         file_path, _ = QFileDialog.getOpenFileName(self, "Load Annotations", self.workspace, "JSON Files (*.json)")
-        if not file_path:
-            return
+        if not file_path: return
 
         try:
             with open(file_path, 'r') as f:
                 data = json.load(f)
 
-            # 1. Restore Class Names
             if "class_names" in data:
-                self.edit_classes.setText(data["class_names"])
+                self.edit_classes.setText(str(data["class_names"]))
                 self.update_class_dropdown()
 
-            # 2. Identify currently loaded video paths for skipping logic
             loaded_paths = [self.list_vids.item(i).text() for i in range(self.list_vids.count())]
             
             count_imported = 0
-            count_skipped = 0
-
-            # 3. Restore Annotations
             for v_path, frames in data.get("annotations", {}).items():
                 if v_path in loaded_paths:
-                    # Initialize dict for this video if not exists
                     self.project_annotations[v_path] = {}
-                    for f_idx, boxes in frames.items():
-                        # Convert list back to (QRectF, class_id)
+                    for f_idx_str, boxes in frames.items():
+                        # CONVERT: JSON Key "0" (string) -> 0 (int)
+                        f_idx = int(f_idx_str) 
                         converted_boxes = []
                         for b in boxes:
-                            rect = QRectF(b[0], b[1], b[2], b[3])
-                            cid = b[4]
+                            # CONVERT: JSON List [x, y, w, h] -> QRectF (float)
+                            rect = QRectF(float(b[0]), float(b[1]), float(b[2]), float(b[3]))
+                            cid = int(b[4])
                             converted_boxes.append((rect, cid))
-                        self.project_annotations[v_path][int(f_idx)] = converted_boxes
+                        self.project_annotations[v_path][f_idx] = converted_boxes
                     count_imported += 1
-                else:
-                    count_skipped += 1
 
-            # 4. Refresh UI
             if self.current_video in self.project_annotations:
                 self.video_ui.annotations = self.project_annotations[self.current_video]
-                self.video_ui.update()
             
-            self.on_ann_change() # Update sidebar stats
-            self.log_app.append(f"📂 IMPORT: Linked {count_imported} videos. Skipped {count_skipped} (Not in queue).")
-            QMessageBox.information(self, "Import Successful", f"Loaded data for {count_imported} videos.\nSkipped {count_skipped} videos not found in your sidebar queue.")
-
+            self.video_ui.update()
+            self.on_ann_change() 
+            self.log_app.append(f"📂 IMPORT: Loaded {count_imported} videos.")
         except Exception as e:
-            QMessageBox.critical(self, "Load Error", f"Failed to parse annotation file:\n{str(e)}")
+            QMessageBox.critical(self, "Load Error", f"JSON Data Error: {str(e)}")
+
+   # Add this inside TAAMMainWindow class
+    def open_behavior_analysis(self):
+            """Pops up the Advanced Analysis Module"""
+            try:
+                # Maintain reference to avoid garbage collection
+                self.behavior_suite = AnalysisModule(self.workspace, self)
+                self.behavior_suite.show()
+            except Exception as e:
+                QMessageBox.critical(self, "Crash Prevented", f"Could not open analysis module: {str(e)}")
 if __name__ == "__main__":
     app = QApplication(sys.argv); w = TAAMMainWindow(); w.show(); sys.exit(app.exec())

@@ -619,16 +619,20 @@ class TAAMEngine:
         cap = cv2.VideoCapture(v_path); fps, w, h = cap.get(5), int(cap.get(3)), int(cap.get(4))
         chunk_paths = self._split_video(cap, fps, w, h, temp); cap.release()
 
+        # Initialize prompts from your UI annotations
         prompts = {}
         if 0 in ann:
             for i, (rect, cid) in enumerate(ann[0]):
+                # Keeping your exact normalized logic: (x / w)
                 prompts[i+1] = {'pt': (rect.center().x() / w, rect.center().y() / h), 'cls': cid}
 
         total_c = len(chunk_paths)
         for i, cp in enumerate(chunk_paths):
             if self.stop_flag or not prompts: break
-            cb(10 + int((i/total_c)*40), f"SAM3 Batch {i+1}")
+            cb(10 + int((i/total_c)*40), f"SAM3 Chunk {i+1}/{total_c}")
             save_p = os.path.join(proc, f"p_{os.path.basename(cp)}")
+            
+            # This method now processes objects 4-at-a-time but returns prompts for the NEXT chunk
             prompts = self._track_chunk(cp, i, prompts, fps, csv_p, pool_dir, w, h, save_p)
 
         self._stitch(proc, vid_p, fps, w, h)
@@ -636,72 +640,121 @@ class TAAMEngine:
         return csv_p
 
     def _track_chunk(self, cp, c_idx, prompts, fps, csv_path, pool_dir, w_orig, h_orig, save_p):
-        state = self.predictor.init_state(video_path=cp, offload_video_to_cpu=True)
-        with torch.inference_mode():
-            for oid, data in prompts.items():
-                pt_norm = data['pt']
-                self.predictor.add_new_points(
-                    state, 0, oid,
-                    torch.tensor([[pt_norm[0], pt_norm[1]]], dtype=torch.float32, device="cuda"),
-                    torch.tensor([1], dtype=torch.int32, device="cuda")
-                )
+        """
+        Tracks objects in batches. The batch size is dynamically pulled from the UI config.
+        """
+        # --- DYNAMIC LINK TO UI ---
+        # Pulls the "SAM3 Batch" value from your UI settings. Default to 1 if not found.
+        obj_batch_size = int(self.config.get('sam_batch', 1))
+        if obj_batch_size < 1: obj_batch_size = 1 
+        
+        prompt_items = list(prompts.items())
+        all_frames_data = {} 
+        last_masks_for_stitch = {}
+        
+        cap_temp = cv2.VideoCapture(cp)
+        frame_count = int(cap_temp.get(7))
+        cap_temp.release()
 
-        last_masks, next_p, vis_data = {}, {}, {}
-        cap_read = cv2.VideoCapture(cp)
-        frame_count = int(cap_read.get(7))
+        # 1. Process groups of objects based on UI Batch Size
+        for b_start in range(0, len(prompt_items), obj_batch_size):
+            batch = prompt_items[b_start : b_start + obj_batch_size]
+            self.log(f"AI: Tracking Object Batch {b_start//obj_batch_size + 1} (Size: {len(batch)})")
 
+            # Initialize state for this specific batch group
+            state = self.predictor.init_state(video_path=cp, offload_video_to_cpu=True)
+            
+            try:
+                with torch.inference_mode():
+                    # Inject points for objects in this specific batch group
+                    for oid, data in batch:
+                        pt_norm = data['pt']
+                        self.predictor.add_new_points(
+                            state, 0, oid,
+                            torch.tensor([[pt_norm[0], pt_norm[1]]], dtype=torch.float32, device="cuda"),
+                            torch.tensor([1], dtype=torch.int32, device="cuda")
+                        )
+
+                    # Propagate tracking for this batch
+                    gen = self.predictor.propagate_in_video(
+                        state, 
+                        start_frame_idx=0, 
+                        max_frame_num_to_track=frame_count, 
+                        reverse=False, 
+                        propagate_preflight=True
+                    )
+
+                    # Collect results into the shared chunk dictionary
+                    for f_idx, oids, _, masks, _ in gen:
+                        if f_idx not in all_frames_data:
+                            all_frames_data[f_idx] = {}
+                        
+                        for j, oid in enumerate(oids):
+                            mask_np = (masks[j] > 0.0).cpu().numpy().squeeze()
+                            centroid, area = self._get_centroid_area(mask_np)
+                            if centroid:
+                                poly_str = self._get_polygon_str(mask_np)
+                                all_frames_data[f_idx][oid] = {
+                                    'pt': centroid, 
+                                    'cls': prompts[oid]['cls'], 
+                                    'area': area, 
+                                    'poly': poly_str
+                                }
+                                # Save mask of the last frame to calculate the "Stitch" point for next chunk
+                                if f_idx == frame_count - 1:
+                                    last_masks_for_stitch[oid] = mask_np
+
+                # Clear points and state for this batch to free GPU VRAM
+                self.predictor.clear_all_points_in_video(state)
+            
+            except Exception as e:
+                self.log(f"AI BATCH ERROR: {e}")
+            
+            finally:
+                # Forcefully delete state and empty cache between batches
+                del state
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+        # 2. Write all merged results (from all batches) to CSV and save frames
         video_base = os.path.splitext(os.path.basename(csv_path))[0].replace("_data", "")
-
+        cap_read = cv2.VideoCapture(cp)
+        
         with open(csv_path, 'a', newline='') as f_csv:
             csv_w = csv.writer(f_csv)
-            gen = self.predictor.propagate_in_video(
-                state,
-                start_frame_idx=0,
-                max_frame_num_to_track=frame_count,
-                reverse=False,
-                propagate_preflight=True
-            )
-
-            for f_idx, oids, _, masks, _ in gen:
+            for f_idx in range(frame_count):
                 ret, frame = cap_read.read()
                 if not ret: break
 
-                global_frame_id = (c_idx * frame_count) + f_idx
-                img_name = f"{video_base}_frame_{int(global_frame_id):06d}.jpg"
-                img_p = os.path.abspath(os.path.join(pool_dir, img_name))
-                cv2.imwrite(img_p, frame)
+                if f_idx in all_frames_data and all_frames_data[f_idx]:
+                    global_frame_id = (c_idx * frame_count) + f_idx
+                    img_name = f"{video_base}_frame_{int(global_frame_id):06d}.jpg"
+                    img_p = os.path.abspath(os.path.join(pool_dir, img_name))
+                    cv2.imwrite(img_p, frame)
 
-                vis_data[f_idx] = {}
-                for j, oid in enumerate(oids):
-                    m = (masks[j] > 0.0).cpu().numpy().squeeze()
-                    c, area = self._get_centroid_area(m)
-                    if c:
-                        poly = self._get_polygon_str(m)
-                        cls = prompts[oid]['cls']
+                    for oid, info in all_frames_data[f_idx].items():
                         csv_w.writerow([
-                            global_frame_id, oid, cls,
-                            c[0], c[1], area, 0, poly, img_p
+                            global_frame_id, oid, info['cls'],
+                            info['pt'][0], info['pt'][1], info['area'], 0, info['poly'], img_p
                         ])
-                        vis_data[f_idx][oid] = {'pt': c, 'cls': cls}
-                        last_masks[oid] = m
-
-        self.predictor.clear_all_points_in_video(state)
         cap_read.release()
-        self._render(cp, save_p, fps, vis_data)
 
+        # 3. Render the preview using the merged data
+        self._render(cp, save_p, fps, all_frames_data)
+
+        # 4. Prepare normalized points for the NEXT chunk (STITCH LOGIC)
         next_prompts = {}
         for oid in prompts.keys():
-            if oid in last_masks:
-                m = last_masks[oid]
+            if oid in last_masks_for_stitch:
+                m = last_masks_for_stitch[oid]
                 c, _ = self._get_centroid_area(m)
                 if c:
                     next_prompts[oid] = {
-                        'pt': (c[0]/w_orig, c[1]/h_orig),
+                        'pt': (c[0]/w_orig, c[1]/h_orig), 
                         'cls': prompts[oid]['cls']
                     }
-
         return next_prompts
-
     def _render(self, inp, out, fps, data):
         cap = cv2.VideoCapture(inp); w, h = int(cap.get(3)), int(cap.get(4))
         writer = cv2.VideoWriter(out, cv2.VideoWriter_fourcc(*'mp4v'), fps, (w, h))

@@ -184,7 +184,7 @@ class TAAMMainWindow(QMainWindow):
         self.tabs.addTab(tab, "Step 3: Fast Track")
 
     def load_video(self):
-        path, _ = QFileDialog.getOpenFileName(self, "Select Video", "", "Video (*.mp4 *.avi)")
+        path, _ = QFileDialog.getOpenFileName(self, "Select Video", "", "Video (*.mp4 *.avi *.MP4 *.MOV)")
         if path:
             self.list_videos.addItem(path)
             self.list_videos.setCurrentRow(self.list_videos.count() - 1)
