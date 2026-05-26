@@ -124,7 +124,7 @@ Always use this to start the app. It prevents "DLL Load Failed" errors.
 
 ### Method B: Manual Installation (Step-by-Step)
 
-If the `.bat` files fail, follow these steps exactly in PowerShell:
+If the `.bat` files fail, follow these steps exactly in PowerShell
 
 ---
 
