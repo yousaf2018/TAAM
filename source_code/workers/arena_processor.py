@@ -147,8 +147,16 @@ class ArenaWorker(QThread):
                             gap = t_p['start_frame'] - t_g['end_frame']
                             dist = np.hypot(t_p['start_pos'][0] - t_g['end_pos'][0], t_p['start_pos'][1] - t_g['end_pos'][1])
                         cost_matrix[i, j] = dist + (gap * 2.0)
+                
+                # Safeguard: Sanitize NaNs and Infs to avoid SciPy C++ crash
+                if np.any(np.isnan(cost_matrix)) or np.any(np.isinf(cost_matrix)):
+                    cost_matrix = np.nan_to_num(cost_matrix, nan=1e6, posinf=1e6, neginf=1e6)
                         
-                row_ind, col_ind = linear_sum_assignment(cost_matrix)
+                try:
+                    row_ind, col_ind = linear_sum_assignment(cost_matrix)
+                except Exception as e:
+                    self.log_signal.emit(f"⚠️ Tracking assignment error bypassed: {str(e)}")
+                    break
                 
                 for r, c in zip(row_ind, col_ind):
                     if cost_matrix[r, c] < 1e5:
@@ -189,12 +197,15 @@ class ArenaWorker(QThread):
         try:
             os.environ['OMP_NUM_THREADS'] = '1'
             os.environ['MKL_NUM_THREADS'] = '1'
+            os.environ['CUDA_LAUNCH_BLOCKING'] = '1'  # Force PyTorch CUDA calls to be synchronous to avoid delayed segfaults
             import cv2
             import torch
             from ultralytics import YOLO
             
             cv2.setNumThreads(0)
-            if torch.cuda.is_available(): torch.set_num_threads(1)
+            if torch.cuda.is_available(): 
+                torch.cuda.init()  # Initialize CUDA runtime context safely inside this thread
+                torch.set_num_threads(1)
 
             start_batch_time = time.time()
             all_arenas = []
@@ -223,8 +234,6 @@ class ArenaWorker(QThread):
                     except:
                         self.log_signal.emit("❌ GPU Failed. CPU Fallback.")
 
-            total_vids = len(self.config['videos'])
-            
             for v_idx, v_path in enumerate(self.config['videos']):
                 if not self.is_running: break
                 
@@ -233,11 +242,13 @@ class ArenaWorker(QThread):
                 os.makedirs(out_dir, exist_ok=True)
                 
                 cap = cv2.VideoCapture(v_path)
-                width, height = int(cap.get(3)), int(cap.get(4))
-                fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-                total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-                ret, bg_frame = cap.read()
-                cap.release()
+                try:
+                    width, height = int(cap.get(3)), int(cap.get(4))
+                    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+                    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                    ret, bg_frame = cap.read()
+                finally:
+                    cap.release()
 
                 if total_frames <= 0: continue
 
@@ -247,83 +258,87 @@ class ArenaWorker(QThread):
                 self.log_signal.emit(f"\n--- [PHASE 1] Inference Engine: {base_n} ---")
                 
                 inf_writer = None
-                if self.config['save_inference_vid']:
-                    inf_writer = cv2.VideoWriter(os.path.join(out_dir, f"{base_n}_inference.mp4"),
-                                                 cv2.VideoWriter_fourcc(*'mp4v'), fps, (width, height))
-                
-                raw_frame_data = defaultdict(list)
-                is_seg = self.config['task_type'] == "Segmentation"
-                
-                results_gen = model.predict(source=v_path, conf=self.config['conf'], stream=True, 
-                                           device=device_target, half=use_half, verbose=False)
-                
-                stopwatch = Stopwatch(); stopwatch.start()
-                frame_count_fps, fps_time, current_fps = 0, 0, 0.0
-
-                for frame_idx, res in enumerate(results_gen):
-                    if not self.is_running: break
-                    frame = res.orig_img.copy() if inf_writer else None
+                try:
+                    if self.config['save_inference_vid']:
+                        inf_writer = cv2.VideoWriter(os.path.join(out_dir, f"{base_n}_inference.mp4"),
+                                                     cv2.VideoWriter_fourcc(*'mp4v'), fps, (width, height))
                     
-                    if res.boxes is not None and len(res.boxes) > 0:
-                        boxes_np = res.boxes.cpu()
-                        masks_data = res.masks.data.cpu().numpy() if is_seg and res.masks else None
-
-                        for j in range(len(boxes_np)):
-                            b = boxes_np.xyxy[j].numpy()
-                            cid = int(boxes_np.cls[j])
-                            conf = float(boxes_np.conf[j])
-                            color = self.class_palette[cid % len(self.class_palette)]
-                            
-                            cx, cy, poly_str, poly_pts = (b[0]+b[2])/2.0, (b[1]+b[3])/2.0, "", None
-
-                            if is_seg and masks_data is not None:
-                                mask_res = cv2.resize(masks_data[j], (width, height), interpolation=cv2.INTER_NEAREST).astype(np.uint8)
-                                M = cv2.moments(mask_res)
-                                if M["m00"] != 0:
-                                    cx, cy = M["m10"]/M["m00"], M["m01"]/M["m00"]
-                                
-                                contours, _ = cv2.findContours(mask_res, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                                if contours:
-                                    cnt = max(contours, key=cv2.contourArea)
-                                    poly_pts = cnt
-                                    poly_str = ";".join([f"{p[0][0]},{p[0][1]}" for p in cnt])
-
-                            tank_num = None
-                            for a_idx, arena in enumerate(all_arenas):
-                                ax, ay, aw, ah = arena['x'], arena['y'], arena['w'], arena['h']
-                                if arena['type'] == 'circle':
-                                    acx, acy, r_sq = ax+(aw/2), ay+(ah/2), ((aw+ah)/4)**2
-                                    if ((cx - acx)**2 + (cy - acy)**2) <= r_sq: tank_num = a_idx + 1; break
-                                else:
-                                    if (ax <= cx <= ax + aw and ay <= cy <= ay + ah): tank_num = a_idx + 1; break
-                            
-                            if tank_num is not None:
-                                det_dict = {
-                                    'frame_idx': frame_idx, 'tank_number': tank_num, 'class_name': class_names[cid],
-                                    'conf': conf, 'x1': b[0], 'y1': b[1], 'x2': b[2], 'y2': b[3],
-                                    'cx': cx, 'cy': cy, 'polygon': poly_str, 'poly_pts': poly_pts, 'cid': cid
-                                }
-                                raw_frame_data[frame_idx].append(det_dict)
-                                
-                                if inf_writer:
-                                    cv2.rectangle(frame, (int(b[0]), int(b[1])), (int(b[2]), int(b[3])), color, self.b_thick)
-                                    if poly_pts is not None:
-                                        cv2.drawContours(frame, [poly_pts], -1, color, max(1, self.b_thick - 1))
-                                    cv2.circle(frame, (int(cx), int(cy)), self.dot_sz, (0, 0, 255), -1)
-
-                    if inf_writer: inf_writer.write(frame)
+                    raw_frame_data = defaultdict(list)
+                    is_seg = self.config['task_type'] == "Segmentation"
                     
-                    frame_count_fps += 1
-                    curr_time = stopwatch.get_elapsed_time(as_float=True)
-                    if curr_time > fps_time + 1.0:
-                        current_fps = frame_count_fps / (curr_time - fps_time)
-                        frame_count_fps, fps_time = 0, curr_time
+                    results_gen = model.predict(source=v_path, conf=self.config['conf'], stream=True, 
+                                               device=device_target, half=use_half, verbose=False)
+                    
+                    stopwatch = Stopwatch(); stopwatch.start()
+                    frame_count_fps, fps_time, current_fps = 0, 0, 0.0
 
-                    if frame_idx % 5 == 0:
-                        pct = int((frame_idx + 1) * 100 / total_frames)
-                        self.progress_signal.emit(pct, f"Inference: {frame_idx}/{total_frames} | {current_fps:.1f} FPS | ETR: {stopwatch.get_etr(frame_idx, total_frames)}")
+                    for frame_idx, res in enumerate(results_gen):
+                        if not self.is_running: break
+                        frame = res.orig_img.copy() if inf_writer else None
+                        
+                        if res.boxes is not None and len(res.boxes) > 0:
+                            boxes_np = res.boxes.cpu()
+                            masks_data = res.masks.data.cpu().numpy() if is_seg and res.masks else None
+
+                            for j in range(len(boxes_np)):
+                                b = boxes_np.xyxy[j].numpy()
+                                cid = int(boxes_np.cls[j])
+                                conf = float(boxes_np.conf[j])
+                                color = self.class_palette[cid % len(self.class_palette)]
+                                
+                                cx, cy, poly_str, poly_pts = (b[0]+b[2])/2.0, (b[1]+b[3])/2.0, "", None
+
+                                if is_seg and masks_data is not None and len(masks_data) > j:
+                                    if masks_data[j].size > 0: # Ensure array data is not empty
+                                        mask_res = cv2.resize(masks_data[j], (width, height), interpolation=cv2.INTER_NEAREST).astype(np.uint8)
+                                        M = cv2.moments(mask_res)
+                                        if M["m00"] != 0:
+                                            cx, cy = M["m10"]/M["m00"], M["m01"]/M["m00"]
+                                        
+                                        contours, _ = cv2.findContours(mask_res, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                                        if contours:
+                                            cnt = max(contours, key=cv2.contourArea)
+                                            poly_pts = cnt
+                                            poly_str = ";".join([f"{p[0][0]},{p[0][1]}" for p in cnt])
+
+                                tank_num = None
+                                for a_idx, arena in enumerate(all_arenas):
+                                    ax, ay, aw, ah = arena['x'], arena['y'], arena['w'], arena['h']
+                                    if arena['type'] == 'circle':
+                                        acx, acy, r_sq = ax+(aw/2), ay+(ah/2), ((aw+ah)/4)**2
+                                        if ((cx - acx)**2 + (cy - acy)**2) <= r_sq: tank_num = a_idx + 1; break
+                                    else:
+                                        if (ax <= cx <= ax + aw and ay <= cy <= ay + ah): tank_num = a_idx + 1; break
+                                
+                                if tank_num is not None:
+                                    det_dict = {
+                                        'frame_idx': frame_idx, 'tank_number': tank_num, 'class_name': class_names[cid],
+                                        'conf': conf, 'x1': b[0], 'y1': b[1], 'x2': b[2], 'y2': b[3],
+                                        'cx': cx, 'cy': cy, 'polygon': poly_str, 'poly_pts': poly_pts, 'cid': cid
+                                    }
+                                    raw_frame_data[frame_idx].append(det_dict)
+                                    
+                                    if inf_writer:
+                                        cv2.rectangle(frame, (int(b[0]), int(b[1])), (int(b[2]), int(b[3])), color, self.b_thick)
+                                        if poly_pts is not None:
+                                            cv2.drawContours(frame, [poly_pts], -1, color, max(1, self.b_thick - 1))
+                                        cv2.circle(frame, (int(cx), int(cy)), self.dot_sz, (0, 0, 255), -1)
+
+                        if inf_writer: inf_writer.write(frame)
+                        
+                        frame_count_fps += 1
+                        curr_time = stopwatch.get_elapsed_time(as_float=True)
+                        if curr_time > fps_time + 1.0:
+                            current_fps = frame_count_fps / (curr_time - fps_time)
+                            frame_count_fps, fps_time = 0, curr_time
+
+                        if frame_idx % 5 == 0:
+                            pct = int((frame_idx + 1) * 100 / total_frames)
+                            self.progress_signal.emit(pct, f"Inference: {frame_idx}/{total_frames} | {current_fps:.1f} FPS | ETR: {stopwatch.get_etr(frame_idx, total_frames)}")
+                finally:
+                    if inf_writer is not None: 
+                        inf_writer.release()
                 
-                if inf_writer: inf_writer.release()
                 if not self.is_running: break
 
                 # ==============================================================
@@ -367,7 +382,16 @@ class ArenaWorker(QThread):
                                 for j, det in enumerate(tank_dets):
                                     cost_matrix[i, j] = np.hypot(tank_active[tid]['pos'][0] - det['cx'], tank_active[tid]['pos'][1] - det['cy'])
 
-                            row_ind, col_ind = linear_sum_assignment(cost_matrix)
+                            # Safeguard: Sanitize NaNs and Infs to avoid SciPy C++ crash
+                            if np.any(np.isnan(cost_matrix)) or np.any(np.isinf(cost_matrix)):
+                                cost_matrix = np.nan_to_num(cost_matrix, nan=1e6, posinf=1e6, neginf=1e6)
+
+                            try:
+                                row_ind, col_ind = linear_sum_assignment(cost_matrix)
+                            except Exception as e:
+                                self.log_signal.emit(f"⚠️ Tracking assignment error bypassed: {str(e)}")
+                                row_ind, col_ind = [], []
+
                             for r, c in zip(row_ind, col_ind):
                                 tid = track_ids[r]; matched_det = tank_dets[c].copy()
                                 matched_det['track_id'] = tid
@@ -397,38 +421,39 @@ class ArenaWorker(QThread):
                     v_cap = cv2.VideoCapture(v_path)
                     trk_writer = cv2.VideoWriter(os.path.join(out_dir, f"{base_n}_tracked.mp4"),
                                                  cv2.VideoWriter_fourcc(*'mp4v'), fps, (width, height))
-                    
-                    for f_idx in range(total_frames):
-                        if not self.is_running: break
-                        ret, frame = v_cap.read()
-                        if not ret: break
-                        
-                        for d in tracked_detections.get(f_idx, []):
-                            x1, y1, x2, y2 = map(int, [d['x1'], d['y1'], d['x2'], d['y2']])
-                            cx, cy = int(d['cx']), int(d['cy'])
-                            t_id = d.get('track_id', 0)
-                            color = self.class_palette[int(d.get('cid', 0)) % len(self.class_palette)]
-                            poly_pts = d.get('poly_pts', None)
+                    try:
+                        for f_idx in range(total_frames):
+                            if not self.is_running: break
+                            ret, frame = v_cap.read()
+                            if not ret: break
+                            
+                            for d in tracked_detections.get(f_idx, []):
+                                x1, y1, x2, y2 = map(int, [d['x1'], d['y1'], d['x2'], d['y2']])
+                                cx, cy = int(d['cx']), int(d['cy'])
+                                t_id = d.get('track_id', 0)
+                                color = self.class_palette[int(d.get('cid', 0)) % len(self.class_palette)]
+                                poly_pts = d.get('poly_pts', None)
 
-                            cv2.rectangle(frame, (x1, y1), (x2, y2), color, self.b_thick)
-                            if is_seg and poly_pts is not None:
-                                ov = frame.copy()
-                                cv2.fillPoly(ov, [poly_pts], color)
-                                cv2.addWeighted(ov, 0.4, frame, 0.6, 0, frame)
-                                cv2.drawContours(frame, [poly_pts], -1, color, max(1, self.b_thick - 1))
-                            
-                            cv2.circle(frame, (cx, cy), self.dot_sz, (0, 0, 255), -1)
-                            
-                            label = f"A{int(d['tank_number'])}|ID{t_id} {d['class_name']}"
-                            (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_DUPLEX, self.l_scale, self.l_thick)
-                            cv2.rectangle(frame, (x1, y1-th-10), (x1+tw+10, y1), color, -1)
-                            cv2.putText(frame, label, (x1+5, y1-7), cv2.FONT_HERSHEY_DUPLEX, self.l_scale, (255,255,255), self.l_thick, cv2.LINE_AA)
-                            
-                        trk_writer.write(frame)
-                        if f_idx % 10 == 0:
-                            self.progress_signal.emit(int((f_idx + 1) * 100 / total_frames), f"Rendering: {f_idx}/{total_frames}")
-
-                    v_cap.release(); trk_writer.release()
+                                cv2.rectangle(frame, (x1, y1), (x2, y2), color, self.b_thick)
+                                if is_seg and poly_pts is not None:
+                                    ov = frame.copy()
+                                    cv2.fillPoly(ov, [poly_pts], color)
+                                    cv2.addWeighted(ov, 0.4, frame, 0.6, 0, frame)
+                                    cv2.drawContours(frame, [poly_pts], -1, color, max(1, self.b_thick - 1))
+                                
+                                cv2.circle(frame, (cx, cy), self.dot_sz, (0, 0, 255), -1)
+                                
+                                label = f"A{int(d['tank_number'])}|ID{t_id} {d['class_name']}"
+                                (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_DUPLEX, self.l_scale, self.l_thick)
+                                cv2.rectangle(frame, (x1, y1-th-10), (x1+tw+10, y1), color, -1)
+                                cv2.putText(frame, label, (x1+5, y1-7), cv2.FONT_HERSHEY_DUPLEX, self.l_scale, (255,255,255), self.l_thick, cv2.LINE_AA)
+                                
+                            trk_writer.write(frame)
+                            if f_idx % 10 == 0:
+                                self.progress_signal.emit(int((f_idx + 1) * 100 / total_frames), f"Rendering: {f_idx}/{total_frames}")
+                    finally:
+                        v_cap.release()
+                        trk_writer.release()
 
                 if self.is_running:
                     self.log_signal.emit("Exporting Analytics Data...")
@@ -453,12 +478,18 @@ class ArenaWorker(QThread):
 
         # 1. Standard CSV Export
         if self.config.get('save_csv'):
-            export_df.to_csv(os.path.join(out, f"{base_n}_tracked_data.csv"), index=False)
+            try:
+                export_df.to_csv(os.path.join(out, f"{base_n}_tracked_data.csv"), index=False)
+            except Exception as e:
+                self.log_signal.emit(f"⚠️ Failed to save CSV: {str(e)}")
 
         # 2. Centroid CSV Export
         if self.config.get('save_centroid_csv'):
-            cent_df = export_df[['Frame', 'Arena', 'ID', 'Class', 'X', 'Y']]
-            cent_df.to_csv(os.path.join(out, f"{base_n}_centroids.csv"), index=False)
+            try:
+                cent_df = export_df[['Frame', 'Arena', 'ID', 'Class', 'X', 'Y']]
+                cent_df.to_csv(os.path.join(out, f"{base_n}_centroids.csv"), index=False)
+            except Exception as e:
+                self.log_signal.emit(f"⚠️ Failed to save Centroids CSV: {str(e)}")
 
         # -------------------------------
         # 3. Excel (By Tank) Export
@@ -473,7 +504,6 @@ class ArenaWorker(QThread):
                 total_rows = len(export_df)
 
                 if total_rows <= MAX_DATA_ROWS:
-                    # DEFAULT BEHAVIOR (no splitting)
                     with pd.ExcelWriter(base_path, engine='openpyxl') as writer:
                         export_df.to_excel(writer, sheet_name="Master_Data", index=False)
 
@@ -483,7 +513,6 @@ class ArenaWorker(QThread):
                                 arena_df.to_excel(writer, sheet_name=f"Arena_{int(a_id)}", index=False)
 
                 else:
-                    # CHUNKED EXPORT
                     num_files = (total_rows // MAX_DATA_ROWS) + 1
 
                     for i in range(num_files):
@@ -521,7 +550,6 @@ class ArenaWorker(QThread):
                 total_rows = len(export_df)
 
                 if total_rows <= MAX_DATA_ROWS:
-                    # DEFAULT BEHAVIOR
                     with pd.ExcelWriter(base_path, engine='openpyxl') as writer:
                         export_df.to_excel(writer, sheet_name="Master_Data", index=False)
 
@@ -531,7 +559,6 @@ class ArenaWorker(QThread):
                                 track_df.to_excel(writer, sheet_name=f"Track_{int(t_id)}", index=False)
 
                 else:
-                    # CHUNKED EXPORT
                     num_files = (total_rows // MAX_DATA_ROWS) + 1
 
                     for i in range(num_files):
@@ -558,24 +585,30 @@ class ArenaWorker(QThread):
 
         # 5. Render Trajectories
         if self.config.get('save_traj') and bg is not None:
-            canvas = bg.copy()
-            for a_id in sorted(export_df['Arena'].unique()):
-                for o_id in sorted(export_df[export_df['Arena']==a_id]['ID'].unique()):
-                    subset = export_df[(export_df['Arena']==a_id)&(export_df['ID']==o_id)].sort_values("Frame")
-                    subset['diff'] = subset['Frame'].diff().fillna(1)
-                    subset['group'] = (subset['diff'] > 1).cumsum()
-                    
-                    for _, group in subset.groupby('group'):
-                        pts = group[['X','Y']].values.astype(np.int32)
-                        random.seed(int(a_id*100 + o_id))
-                        clr = (random.randint(60,255), random.randint(60,255), random.randint(60,255))
-                        if len(pts)>1: cv2.polylines(canvas, [pts], False, clr, 1, cv2.LINE_AA)
-            cv2.imwrite(os.path.join(out, f"{base_n}_trajectories.png"), canvas)
+            try:
+                canvas = bg.copy()
+                for a_id in sorted(export_df['Arena'].unique()):
+                    for o_id in sorted(export_df[export_df['Arena']==a_id]['ID'].unique()):
+                        subset = export_df[(export_df['Arena']==a_id)&(export_df['ID']==o_id)].sort_values("Frame")
+                        subset['diff'] = subset['Frame'].diff().fillna(1)
+                        subset['group'] = (subset['diff'] > 1).cumsum()
+                        
+                        for _, group in subset.groupby('group'):
+                            pts = group[['X','Y']].values.astype(np.int32)
+                            random.seed(int(a_id*100 + o_id))
+                            clr = (random.randint(60,255), random.randint(60,255), random.randint(60,255))
+                            if len(pts)>1: cv2.polylines(canvas, [pts], False, clr, 1, cv2.LINE_AA)
+                cv2.imwrite(os.path.join(out, f"{base_n}_trajectories.png"), canvas)
+            except Exception as e:
+                self.log_signal.emit(f"⚠️ Failed to save trajectories visual: {str(e)}")
 
         # 6. Render Heatmap
         if self.config.get('save_heat') and bg is not None:
-            h, w = bg.shape[:2]; accum = np.zeros((h, w), dtype=np.float32)
-            for _, r in export_df.iterrows(): cv2.circle(accum, (int(r['X']), int(r['Y'])), 10, 0.4, -1)
-            accum = cv2.normalize(cv2.GaussianBlur(accum, (51, 51), 0), None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-            heatmap = cv2.applyColorMap(accum, cv2.COLORMAP_JET)
-            cv2.imwrite(os.path.join(out, f"{base_n}_heatmap.png"), cv2.addWeighted(bg, 0.6, heatmap, 0.4, 0))
+            try:
+                h, w = bg.shape[:2]; accum = np.zeros((h, w), dtype=np.float32)
+                for _, r in export_df.iterrows(): cv2.circle(accum, (int(r['X']), int(r['Y'])), 10, 0.4, -1)
+                accum = cv2.normalize(cv2.GaussianBlur(accum, (51, 51), 0), None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+                heatmap = cv2.applyColorMap(accum, cv2.COLORMAP_JET)
+                cv2.imwrite(os.path.join(out, f"{base_n}_heatmap.png"), cv2.addWeighted(bg, 0.6, heatmap, 0.4, 0))
+            except Exception as e:
+                self.log_signal.emit(f"⚠️ Failed to save heatmap visual: {str(e)}") 

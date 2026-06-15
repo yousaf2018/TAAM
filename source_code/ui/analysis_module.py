@@ -26,16 +26,51 @@ class AnalysisWorker(QThread):
                     p, self.config, self.arenas, self.arena_configs, self.log_signal
                 )
                 
+                # Temporary container to hold rows for the current file's individual export
+                indiv_sums = []
                 for s in sum_list:
                     row = {"Group": g_name, "Source": os.path.basename(p), "Arena_ID": s["Arena_ID"]}
                     for m in self.selected_metrics:
                         if m in s: row[m] = s[m]
                     all_sums.append(row)
+                    indiv_sums.append(row)
                 
                 if not kinetics_df.empty:
                     kinetics_df.insert(0, 'Source', os.path.basename(p))
                     kinetics_df.insert(0, 'Group', g_name)
                     all_kins.append(kinetics_df)
+                
+                # --- SAVE INDIVIDUAL EXCEL FILE IN SEPARATE "Endpoints" FOLDER ---
+                endpoints_dir = os.path.join(self.workspace, "Endpoints")
+                os.makedirs(endpoints_dir, exist_ok=True)
+                
+                # Set proper output name from source file name
+                source_basename = os.path.basename(p)
+                source_stem = os.path.splitext(source_basename)[0]
+                indiv_save_path = os.path.join(endpoints_dir, f"{source_stem}_processed.xlsx")
+                
+                df_indiv_summary = pd.DataFrame(indiv_sums)
+                
+                # Calculate the averages of all arenas for this specific file
+                if not df_indiv_summary.empty:
+                    numeric_cols_indiv = [c for c in df_indiv_summary.columns if c not in ["Group", "Source", "Arena_ID"]]
+                    df_indiv_mean = df_indiv_summary[numeric_cols_indiv].mean().to_frame().T
+                    df_indiv_mean.insert(0, 'Source', source_basename)
+                    df_indiv_mean.insert(0, 'Group', g_name)
+                    df_indiv_mean.insert(2, 'Aggregation_Type', 'AVERAGE')
+                else:
+                    df_indiv_mean = pd.DataFrame()
+                
+                with pd.ExcelWriter(indiv_save_path) as indiv_writer:
+                    if not df_indiv_mean.empty:
+                        df_indiv_mean.to_excel(indiv_writer, sheet_name="Arena_Averages", index=False)
+                    if not df_indiv_summary.empty:
+                        df_indiv_summary.to_excel(indiv_writer, sheet_name="Individual_Results", index=False)
+                    if not kinetics_df.empty:
+                        kinetics_df.to_excel(indiv_writer, sheet_name="Frame_Wise_Kinetics", index=False)
+                
+                self.log_signal.emit(f"[TAAM IO] Saved individual endpoints to: Endpoints/{os.path.basename(indiv_save_path)}")
+                # -----------------------------------------------------------------
                 
                 self.progress_signal.emit(int(((i+1)/len(files))*100))
 
