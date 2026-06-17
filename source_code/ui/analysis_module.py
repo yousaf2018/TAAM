@@ -1,7 +1,92 @@
 import os, sys, cv2, json, math, pandas as pd, numpy as np
+import zipfile, io, re  # Added for XML sanitization
+
+# PyQt6 Graphic User Interface Imports
 from PyQt6.QtWidgets import *
 from PyQt6.QtCore import *
 from PyQt6.QtGui import *
+
+# =========================================================================
+# SELF-HEALING CALAMINE AUTO-INSTALLER
+# Safely installs the high-performance calamine spreadsheet engine on-the-fly
+# =========================================================================
+try:
+    import python_calamine
+except ImportError:
+    try:
+        import subprocess
+        # Use sys.executable to target the active virtual environment pip
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "python-calamine"])
+        import python_calamine
+        print("[TAAM] Successfully auto-installed python-calamine engine.")
+    except Exception as install_err:
+        print(f"[TAAM] python-calamine auto-installation skipped/failed: {str(install_err)}")
+
+# =========================================================================
+# SPREADSHEET XML SANITIZER MONKEYPATCH
+# Intercepts pandas Excel loading to sanitize invalid XML tokens on the fly
+# =========================================================================
+original_ExcelFile = pd.ExcelFile
+
+class SafeExcelFile(original_ExcelFile):
+    def __init__(self, io_source, engine=None, storage_options=None):
+        sanitized_source = io_source
+        if isinstance(io_source, str) and os.path.exists(io_source):
+            try:
+                # Regex to match illegal XML control characters (0x00-0x08, 0x0B-0x0C, 0x0E-0x1F)
+                illegal_xml_re = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f]')
+                # Regex to safely replace raw '&' with '&amp;' unless it is already a valid entity
+                amp_xml_re = re.compile(r'&(?!amp;|lt;|gt;|quot;|apos;|#\d+;|#[xX][0-9a-fA-F]+;)')
+                
+                with open(io_source, 'rb') as f:
+                    file_bytes = f.read()
+                
+                # Sanitize XML inside the zip archive in-memory
+                in_zip = zipfile.ZipFile(io.BytesIO(file_bytes))
+                out_buffer = io.BytesIO()
+                with zipfile.ZipFile(out_buffer, 'w', zipfile.ZIP_DEFLATED) as out_zip:
+                    for item in in_zip.infolist():
+                        data = in_zip.read(item.filename)
+                        if item.filename.endswith('.xml') or item.filename.endswith('.rels'):
+                            try:
+                                # Safe multi-encoding decoding with ignore strategy for corrupt bytes
+                                try:
+                                    xml_str = data.decode('utf-8', errors='ignore')
+                                except Exception:
+                                    xml_str = data.decode('utf-16', errors='ignore')
+                                    
+                                xml_str = illegal_xml_re.sub('', xml_str)
+                                xml_str = amp_xml_re.sub('&amp;', xml_str)
+                                data = xml_str.encode('utf-8')
+                            except Exception as parse_err:
+                                print(f"[TAAM SANITIZER] Sheet XML decode warning: {str(parse_err)}")
+                        out_zip.writestr(item, data)
+                out_buffer.seek(0)
+                sanitized_source = out_buffer
+            except Exception as sanitization_error:
+                print(f"[TAAM SANITIZER ERROR] Failed to sanitize XML: {str(sanitization_error)}")
+                sanitized_source = io_source
+
+        # Cascade through safe reading engines
+        for eng in ["calamine", "openpyxl", None]:
+            try:
+                super().__init__(sanitized_source, engine=eng, storage_options=storage_options)
+                return
+            except Exception as e:
+                last_exception = e
+                if hasattr(sanitized_source, "seek"):
+                    sanitized_source.seek(0)
+        raise last_exception
+
+# Apply monkeypatch globally across all pandas namespaces so backend code inherits it
+import pandas
+import pandas.io.excel
+pd.ExcelFile = SafeExcelFile
+pandas.ExcelFile = SafeExcelFile
+pandas.io.excel.ExcelFile = SafeExcelFile
+pandas.io.excel._base.ExcelFile = SafeExcelFile
+# =========================================================================
+
 from backend.analysis_engine import AnalysisEngine
 
 class AnalysisWorker(QThread):
@@ -15,12 +100,21 @@ class AnalysisWorker(QThread):
         self.config, self.selected_metrics, self.workspace = config, metrics, workspace
 
     def run(self):
-        all_sums, all_kins, stems = [], [], []
+        all_sums, stems = [], []  # removed all_kins initialization to optimize RAM usage
         files = [p for paths in self.groups.values() for p in paths]
+        p = None
+        arena_id = None
+        sheet_found = None
         try:
+            self.log_signal.emit(f"[TAAM IO] Started batch process for {len(files)} Excel file(s)...")
+            
             for i, p in enumerate(files):
-                g_name = next(g for g, paths in self.groups.items() if p in paths)
-                stems.append(os.path.splitext(os.path.basename(p))[0])
+                g_name = next(g for g, paths in self.experimental_groups.items() if p in paths) if hasattr(self, 'experimental_groups') else next(g for g, paths in self.groups.items() if p in paths)
+                source_basename = os.path.basename(p)
+                stems.append(os.path.splitext(source_basename)[0])
+                
+                # Active file status logger
+                self.log_signal.emit(f"\n[TAAM Math] Processing File ({i+1}/{len(files)}): {source_basename}")
                 
                 sum_list, kinetics_df = AnalysisEngine.calculate_behavior(
                     p, self.config, self.arenas, self.arena_configs, self.log_signal
@@ -29,23 +123,22 @@ class AnalysisWorker(QThread):
                 # Temporary container to hold rows for the current file's individual export
                 indiv_sums = []
                 for s in sum_list:
-                    row = {"Group": g_name, "Source": os.path.basename(p), "Arena_ID": s["Arena_ID"]}
+                    row = {"Group": g_name, "Source": source_basename, "Arena_ID": s["Arena_ID"]}
                     for m in self.selected_metrics:
                         if m in s: row[m] = s[m]
                     all_sums.append(row)
                     indiv_sums.append(row)
                 
                 if not kinetics_df.empty:
-                    kinetics_df.insert(0, 'Source', os.path.basename(p))
+                    kinetics_df.insert(0, 'Source', source_basename)
                     kinetics_df.insert(0, 'Group', g_name)
-                    all_kins.append(kinetics_df)
+                    # removed global append to save system memory
                 
                 # --- SAVE INDIVIDUAL EXCEL FILE IN SEPARATE "Endpoints" FOLDER ---
                 endpoints_dir = os.path.join(self.workspace, "Endpoints")
                 os.makedirs(endpoints_dir, exist_ok=True)
                 
                 # Set proper output name from source file name
-                source_basename = os.path.basename(p)
                 source_stem = os.path.splitext(source_basename)[0]
                 indiv_save_path = os.path.join(endpoints_dir, f"{source_stem}_processed.xlsx")
                 
@@ -53,6 +146,7 @@ class AnalysisWorker(QThread):
                 
                 # Calculate the averages of all arenas for this specific file
                 if not df_indiv_summary.empty:
+                    self.log_signal.emit(f"      -> Calculating arena-wise averages...")
                     numeric_cols_indiv = [c for c in df_indiv_summary.columns if c not in ["Group", "Source", "Arena_ID"]]
                     df_indiv_mean = df_indiv_summary[numeric_cols_indiv].mean().to_frame().T
                     df_indiv_mean.insert(0, 'Source', source_basename)
@@ -61,6 +155,7 @@ class AnalysisWorker(QThread):
                 else:
                     df_indiv_mean = pd.DataFrame()
                 
+                self.log_signal.emit(f"      -> Writing worksheets for {source_basename}...")
                 with pd.ExcelWriter(indiv_save_path) as indiv_writer:
                     if not df_indiv_mean.empty:
                         df_indiv_mean.to_excel(indiv_writer, sheet_name="Arena_Averages", index=False)
@@ -69,15 +164,17 @@ class AnalysisWorker(QThread):
                     if not kinetics_df.empty:
                         kinetics_df.to_excel(indiv_writer, sheet_name="Frame_Wise_Kinetics", index=False)
                 
-                self.log_signal.emit(f"[TAAM IO] Saved individual endpoints to: Endpoints/{os.path.basename(indiv_save_path)}")
+                self.log_signal.emit(f"      -> Saved individual processed file: Endpoints/{os.path.basename(indiv_save_path)}")
                 # -----------------------------------------------------------------
                 
                 self.progress_signal.emit(int(((i+1)/len(files))*100))
 
             if all_sums:
+                self.log_signal.emit(f"\n[TAAM Math] All individual session files processed successfully.")
                 name = "_".join(stems[:2]) + f"_n{len(stems)}_analysis.xlsx"
                 save_path = os.path.join(self.workspace, name)
-                self.log_signal.emit(f"[TAAM IO] Generating Multi-sheet Workbook & Computing Group Math...")
+                
+                self.log_signal.emit(f"[TAAM IO] Generating Master Aggregated Workbook: {name}")
                 
                 # Group-wise Calculations
                 df_summary = pd.DataFrame(all_sums)
@@ -90,34 +187,35 @@ class AnalysisWorker(QThread):
                 df_sum.insert(1, 'Aggregation_Type', 'SUM')
                 
                 df_group_agg = pd.concat([df_mean, df_sum]).sort_values("Group")
-
-                MAX_EXCEL_ROWS = 1000000 # Prevents Excel from crashing
                 
+                # Only write aggregated and individual summaries to the master file (optimized)
                 with pd.ExcelWriter(save_path) as writer:
                     df_group_agg.to_excel(writer, sheet_name="Group_Averages_Sums", index=False)
                     df_summary.to_excel(writer, sheet_name="Individual_Results", index=False)
-                    
-                    if all_kins:
-                        master_kinetics = pd.concat(all_kins, ignore_index=True)
-                        total_rows = len(master_kinetics)
-                        
-                        if total_rows > MAX_EXCEL_ROWS:
-                            self.log_signal.emit(f"[TAAM IO] Large data ({total_rows} rows). Splitting sheets...")
-                            num_chunks = math.ceil(total_rows / MAX_EXCEL_ROWS)
-                            
-                            for c_idx in range(num_chunks):
-                                start_r = c_idx * MAX_EXCEL_ROWS
-                                end_r = min((c_idx + 1) * MAX_EXCEL_ROWS, total_rows)
-                                chunk = master_kinetics.iloc[start_r:end_r]
-                                sheet_name = f"Frame_Kinetics_Pt{c_idx+1}"
-                                chunk.to_excel(writer, sheet_name=sheet_name, index=False)
-                                self.log_signal.emit(f"      Saved {sheet_name}")
-                        else:
-                            master_kinetics.to_excel(writer, sheet_name="Frame_Wise_Kinetics", index=False)
 
+                self.log_signal.emit(f"[TAAM IO] Master Aggregated Workbook generated safely.")
                 self.finished_signal.emit(f"Success! TAAM Data exported safely to {name}")
         except Exception as e:
-            self.log_signal.emit(f"Error: {str(e)}")
+            import traceback
+            exc_type, exc_value, exc_tb = sys.exc_info()
+            tb_details = traceback.format_tb(exc_tb)
+            
+            self.log_signal.emit(f"\n[TAAM ERROR] Critical failure during execution!")
+            self.log_signal.emit(f"Error Type: {exc_type.__name__}")
+            self.log_signal.emit(f"Error Details: {str(e)}")
+            
+            # Identify which file and sheet caused the crash
+            if p is not None:
+                self.log_signal.emit(f"Active File when crashed: {os.path.basename(p)}")
+            
+            # Actionable diagnostics for XML parsing errors
+            if "not well-formed" in str(e) or "ParseError" in str(e):
+                self.log_signal.emit("\n[Actionable Advice] This is an XML parsing error.")
+                self.log_signal.emit("It occurs because your processed spreadsheet is extremely large or contains illegal XML tokens (like raw '&' characters).")
+                self.log_signal.emit("-> Solution: Please run 'pip install python-calamine' in your terminal.")
+                self.log_signal.emit("Once installed, TAAM will use Calamine to read large spreadsheets instantly, avoiding Python XML parser limits.")
+            
+            self.log_signal.emit(f"\nTraceback Details:\n" + "".join(tb_details))
 
 class AnalysisModule(QDialog):
     def __init__(self, workspace, parent=None):
@@ -243,9 +341,12 @@ class AnalysisModule(QDialog):
         fi, gi = self.list_files.currentItem(), self.list_groups.currentItem()
         if fi: self.experimental_groups[gi.text()].remove(next(p for p in self.experimental_groups[gi.text()] if os.path.basename(p)==fi.text())); self.update_file_list(gi)
         elif gi: self.experimental_groups.pop(gi.text()); self.list_groups.takeItem(self.list_groups.row(gi)); self.list_files.clear()
+    
+    # Decoded frame buffer validation added here to prevent segmentation faults
     def load_video(self):
         p, _ = QFileDialog.getOpenFileName(self, "Video", self.workspace, "Videos (*.mp4 *.avi *.MP4 *.MOV)"); cap = cv2.VideoCapture(p); stat, f = cap.read()
-        if stat: self.video_path_stored = p; self.video_frame = f; self.update_view()
+        if stat and f is not None and isinstance(f, np.ndarray) and f.size > 0: 
+            self.video_path_stored = p; self.video_frame = f; self.update_view()
         cap.release()
 
     def adjust_center(self):
@@ -287,9 +388,10 @@ class AnalysisModule(QDialog):
                     else: self.arenas.append({'type':d['type'], 'x':d['x'], 'y':d['y'], 'w':d['w'], 'h':d['h']})
             self.combo_arena.clear(); [self.combo_arena.addItem(f"Arena {i+1}") for i in range(len(self.arenas))]; self.update_view()
 
-
+    # Safety checks added here to protect memory heap inside Qt6 graphics painting
     def update_view(self):
-        if self.video_frame is None: return
+        if self.video_frame is None or not isinstance(self.video_frame, np.ndarray) or self.video_frame.size == 0: 
+            return
         canvas = self.video_frame.copy(); cur = self.combo_arena.currentIndex()
 
         for i, roi in enumerate(self.arenas):

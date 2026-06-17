@@ -241,224 +241,239 @@ class ArenaWorker(QThread):
                 out_dir = os.path.join(self.workspace, "Advanced_Results", base_n)
                 os.makedirs(out_dir, exist_ok=True)
                 
-                cap = cv2.VideoCapture(v_path)
+                # --- INDIVIDUAL VIDEO RUNTIME ISOLATION FOR STABILITY ---
                 try:
-                    width, height = int(cap.get(3)), int(cap.get(4))
-                    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-                    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-                    ret, bg_frame = cap.read()
-                finally:
-                    cap.release()
-
-                if total_frames <= 0: continue
-
-                # ==============================================================
-                # PHASE 1: STREAMING INFERENCE
-                # ==============================================================
-                self.log_signal.emit(f"\n--- [PHASE 1] Inference Engine: {base_n} ---")
-                
-                inf_writer = None
-                try:
-                    if self.config['save_inference_vid']:
-                        inf_writer = cv2.VideoWriter(os.path.join(out_dir, f"{base_n}_inference.mp4"),
-                                                     cv2.VideoWriter_fourcc(*'mp4v'), fps, (width, height))
-                    
-                    raw_frame_data = defaultdict(list)
-                    is_seg = self.config['task_type'] == "Segmentation"
-                    
-                    results_gen = model.predict(source=v_path, conf=self.config['conf'], stream=True, 
-                                               device=device_target, half=use_half, verbose=False)
-                    
-                    stopwatch = Stopwatch(); stopwatch.start()
-                    frame_count_fps, fps_time, current_fps = 0, 0, 0.0
-
-                    for frame_idx, res in enumerate(results_gen):
-                        if not self.is_running: break
-                        frame = res.orig_img.copy() if inf_writer else None
-                        
-                        if res.boxes is not None and len(res.boxes) > 0:
-                            boxes_np = res.boxes.cpu()
-                            masks_data = res.masks.data.cpu().numpy() if is_seg and res.masks else None
-
-                            for j in range(len(boxes_np)):
-                                b = boxes_np.xyxy[j].numpy()
-                                cid = int(boxes_np.cls[j])
-                                conf = float(boxes_np.conf[j])
-                                color = self.class_palette[cid % len(self.class_palette)]
-                                
-                                cx, cy, poly_str, poly_pts = (b[0]+b[2])/2.0, (b[1]+b[3])/2.0, "", None
-
-                                if is_seg and masks_data is not None and len(masks_data) > j:
-                                    if masks_data[j].size > 0: # Ensure array data is not empty
-                                        mask_res = cv2.resize(masks_data[j], (width, height), interpolation=cv2.INTER_NEAREST).astype(np.uint8)
-                                        M = cv2.moments(mask_res)
-                                        if M["m00"] != 0:
-                                            cx, cy = M["m10"]/M["m00"], M["m01"]/M["m00"]
-                                        
-                                        contours, _ = cv2.findContours(mask_res, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                                        if contours:
-                                            cnt = max(contours, key=cv2.contourArea)
-                                            poly_pts = cnt
-                                            poly_str = ";".join([f"{p[0][0]},{p[0][1]}" for p in cnt])
-
-                                tank_num = None
-                                for a_idx, arena in enumerate(all_arenas):
-                                    ax, ay, aw, ah = arena['x'], arena['y'], arena['w'], arena['h']
-                                    if arena['type'] == 'circle':
-                                        acx, acy, r_sq = ax+(aw/2), ay+(ah/2), ((aw+ah)/4)**2
-                                        if ((cx - acx)**2 + (cy - acy)**2) <= r_sq: tank_num = a_idx + 1; break
-                                    else:
-                                        if (ax <= cx <= ax + aw and ay <= cy <= ay + ah): tank_num = a_idx + 1; break
-                                
-                                if tank_num is not None:
-                                    det_dict = {
-                                        'frame_idx': frame_idx, 'tank_number': tank_num, 'class_name': class_names[cid],
-                                        'conf': conf, 'x1': b[0], 'y1': b[1], 'x2': b[2], 'y2': b[3],
-                                        'cx': cx, 'cy': cy, 'polygon': poly_str, 'poly_pts': poly_pts, 'cid': cid
-                                    }
-                                    raw_frame_data[frame_idx].append(det_dict)
-                                    
-                                    if inf_writer:
-                                        cv2.rectangle(frame, (int(b[0]), int(b[1])), (int(b[2]), int(b[3])), color, self.b_thick)
-                                        if poly_pts is not None:
-                                            cv2.drawContours(frame, [poly_pts], -1, color, max(1, self.b_thick - 1))
-                                        cv2.circle(frame, (int(cx), int(cy)), self.dot_sz, (0, 0, 255), -1)
-
-                        if inf_writer: inf_writer.write(frame)
-                        
-                        frame_count_fps += 1
-                        curr_time = stopwatch.get_elapsed_time(as_float=True)
-                        if curr_time > fps_time + 1.0:
-                            current_fps = frame_count_fps / (curr_time - fps_time)
-                            frame_count_fps, fps_time = 0, curr_time
-
-                        if frame_idx % 5 == 0:
-                            pct = int((frame_idx + 1) * 100 / total_frames)
-                            self.progress_signal.emit(pct, f"Inference: {frame_idx}/{total_frames} | {current_fps:.1f} FPS | ETR: {stopwatch.get_etr(frame_idx, total_frames)}")
-                finally:
-                    if inf_writer is not None: 
-                        inf_writer.release()
-                
-                if not self.is_running: break
-
-                # ==============================================================
-                # PHASE 2: BATCH PROCESSING (TRACKING & NMS)
-                # ==============================================================
-                self.log_signal.emit(f"\n--- [PHASE 2] Tracking & Optimization ---")
-                
-                self.log_signal.emit("Running NMS Duplication Merging...")
-                clean_detections = self._merge_frame_duplicates_pre_tracking(raw_frame_data)
-                
-                tracked_detections = defaultdict(list)
-                num_tanks = len(all_arenas)
-                
-                if self.config['method'] == "Custom Force-N":
-                    self.log_signal.emit("Applying Custom Force-N tracking...")
-                    active_tracks = {t: {} for t in range(1, num_tanks + 1)}
-                    for frame_idx in range(total_frames):
-                        dets_this_frame = clean_detections.get(frame_idx, [])
-                        for tank_num in range(1, num_tanks + 1):
-                            tank_dets = [d for d in dets_this_frame if d.get('tank_number') == tank_num]
-                            tank_dets.sort(key=lambda x: x.get('conf', 0.0), reverse=True)
-                            tank_dets = tank_dets[:self.config['max_n']]
-                            tank_active = active_tracks[tank_num]
-                            
-                            if len(tank_active) < self.config['max_n']:
-                                unassigned_dets = []
-                                for det in tank_dets:
-                                    new_id = len(tank_active) + 1
-                                    if new_id <= self.config['max_n']:
-                                        det['track_id'] = new_id
-                                        tank_active[new_id] = {'pos': (det['cx'], det['cy'])}
-                                        tracked_detections[frame_idx].append(det)
-                                    else: unassigned_dets.append(det)
-                                tank_dets = unassigned_dets 
-                            
-                            if not tank_dets: continue 
-                                
-                            track_ids = list(tank_active.keys())
-                            cost_matrix = np.full((len(track_ids), len(tank_dets)), 1e6) 
-                            for i, tid in enumerate(track_ids):
-                                for j, det in enumerate(tank_dets):
-                                    cost_matrix[i, j] = np.hypot(tank_active[tid]['pos'][0] - det['cx'], tank_active[tid]['pos'][1] - det['cy'])
-
-                            # Safeguard: Sanitize NaNs and Infs to avoid SciPy C++ crash
-                            if np.any(np.isnan(cost_matrix)) or np.any(np.isinf(cost_matrix)):
-                                cost_matrix = np.nan_to_num(cost_matrix, nan=1e6, posinf=1e6, neginf=1e6)
-
-                            try:
-                                row_ind, col_ind = linear_sum_assignment(cost_matrix)
-                            except Exception as e:
-                                self.log_signal.emit(f"⚠️ Tracking assignment error bypassed: {str(e)}")
-                                row_ind, col_ind = [], []
-
-                            for r, c in zip(row_ind, col_ind):
-                                tid = track_ids[r]; matched_det = tank_dets[c].copy()
-                                matched_det['track_id'] = tid
-                                tank_active[tid] = {'pos': (matched_det['cx'], matched_det['cy'])}
-                                tracked_detections[frame_idx].append(matched_det)
-                                
-                elif self.config['method'] == "Confidence Filter":
-                    self.log_signal.emit("Applying Confidence Filter...")
-                    for frame_idx, dets in clean_detections.items():
-                        tank_groups = defaultdict(list)
-                        for det in dets: tank_groups[det.get('tank_number')].append(det)
-                        for tank_num, tank_dets in tank_groups.items():
-                            tank_dets.sort(key=lambda x: x.get('conf', 0.0), reverse=True)
-                            valid_dets = tank_dets[:self.config['max_n']]
-                            for i, d in enumerate(valid_dets):
-                                d['track_id'] = i + 1
-                                tracked_detections[frame_idx].append(d)
-
-                if self.config['auto_stitch'] and self.config['method'] != "Custom Force-N":
-                    tracked_detections = self._force_stitch_to_max(tracked_detections)
-
-                # ==============================================================
-                # PHASE 3: RENDER VIDEO & ANALYTICS EXPORT
-                # ==============================================================
-                if self.config['save_video']:
-                    self.log_signal.emit(f"\n--- [PHASE 3] Rendering Tracked Video ---")
-                    v_cap = cv2.VideoCapture(v_path)
-                    trk_writer = cv2.VideoWriter(os.path.join(out_dir, f"{base_n}_tracked.mp4"),
-                                                 cv2.VideoWriter_fourcc(*'mp4v'), fps, (width, height))
+                    cap = cv2.VideoCapture(v_path)
                     try:
-                        for f_idx in range(total_frames):
-                            if not self.is_running: break
-                            ret, frame = v_cap.read()
-                            if not ret: break
-                            
-                            for d in tracked_detections.get(f_idx, []):
-                                x1, y1, x2, y2 = map(int, [d['x1'], d['y1'], d['x2'], d['y2']])
-                                cx, cy = int(d['cx']), int(d['cy'])
-                                t_id = d.get('track_id', 0)
-                                color = self.class_palette[int(d.get('cid', 0)) % len(self.class_palette)]
-                                poly_pts = d.get('poly_pts', None)
-
-                                cv2.rectangle(frame, (x1, y1), (x2, y2), color, self.b_thick)
-                                if is_seg and poly_pts is not None:
-                                    ov = frame.copy()
-                                    cv2.fillPoly(ov, [poly_pts], color)
-                                    cv2.addWeighted(ov, 0.4, frame, 0.6, 0, frame)
-                                    cv2.drawContours(frame, [poly_pts], -1, color, max(1, self.b_thick - 1))
-                                
-                                cv2.circle(frame, (cx, cy), self.dot_sz, (0, 0, 255), -1)
-                                
-                                label = f"A{int(d['tank_number'])}|ID{t_id} {d['class_name']}"
-                                (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_DUPLEX, self.l_scale, self.l_thick)
-                                cv2.rectangle(frame, (x1, y1-th-10), (x1+tw+10, y1), color, -1)
-                                cv2.putText(frame, label, (x1+5, y1-7), cv2.FONT_HERSHEY_DUPLEX, self.l_scale, (255,255,255), self.l_thick, cv2.LINE_AA)
-                                
-                            trk_writer.write(frame)
-                            if f_idx % 10 == 0:
-                                self.progress_signal.emit(int((f_idx + 1) * 100 / total_frames), f"Rendering: {f_idx}/{total_frames}")
+                        width, height = int(cap.get(3)), int(cap.get(4))
+                        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+                        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                        ret, bg_frame = cap.read()
                     finally:
-                        v_cap.release()
-                        trk_writer.release()
+                        cap.release()
 
-                if self.is_running:
-                    self.log_signal.emit("Exporting Analytics Data...")
-                    flat_data = [d for f, dets in tracked_detections.items() for d in dets]
-                    self._generate_analytics(base_n, flat_data, bg_frame, out_dir, width, height)
+                    # Confirm frame data is valid to prevent segmentation faults during rendering
+                    if total_frames <= 0 or width <= 0 or height <= 0 or bg_frame is None or bg_frame.size == 0:
+                        self.log_signal.emit(f"❌ Error: Video file {base_n} is empty or corrupted. Skipping to next file...")
+                        continue
+
+                    # ==============================================================
+                    # PHASE 1: STREAMING INFERENCE
+                    # ==============================================================
+                    self.log_signal.emit(f"\n--- [PHASE 1] Inference Engine: {base_n} ---")
+                    
+                    inf_writer = None
+                    try:
+                        if self.config['save_inference_vid']:
+                            inf_writer = cv2.VideoWriter(os.path.join(out_dir, f"{base_n}_inference.mp4"),
+                                                         cv2.VideoWriter_fourcc(*'mp4v'), fps, (width, height))
+                        
+                        raw_frame_data = defaultdict(list)
+                        is_seg = self.config['task_type'] == "Segmentation"
+                        
+                        results_gen = model.predict(source=v_path, conf=self.config['conf'], stream=True, 
+                                                   device=device_target, half=use_half, verbose=False)
+                        
+                        stopwatch = Stopwatch(); stopwatch.start()
+                        frame_count_fps, fps_time, current_fps = 0, 0, 0.0
+
+                        for frame_idx, res in enumerate(results_gen):
+                            if not self.is_running: break
+                            frame = res.orig_img.copy() if inf_writer else None
+                            
+                            if res.boxes is not None and len(res.boxes) > 0:
+                                boxes_np = res.boxes.cpu()
+                                masks_data = res.masks.data.cpu().numpy() if is_seg and res.masks else None
+
+                                for j in range(len(boxes_np)):
+                                    b = boxes_np.xyxy[j].numpy()
+                                    cid = int(boxes_np.cls[j])
+                                    conf = float(boxes_np.conf[j])
+                                    color = self.class_palette[cid % len(self.class_palette)]
+                                    
+                                    cx, cy, poly_str, poly_pts = (b[0]+b[2])/2.0, (b[1]+b[3])/2.0, "", None
+
+                                    if is_seg and masks_data is not None and len(masks_data) > j:
+                                        if masks_data[j].size > 0: # Ensure array data is not empty
+                                            mask_res = cv2.resize(masks_data[j], (width, height), interpolation=cv2.INTER_NEAREST).astype(np.uint8)
+                                            M = cv2.moments(mask_res)
+                                            if M["m00"] != 0:
+                                                cx, cy = M["m10"]/M["m00"], M["m01"]/M["m00"]
+                                            
+                                            contours, _ = cv2.findContours(mask_res, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                                            if contours:
+                                                cnt = max(contours, key=cv2.contourArea)
+                                                poly_pts = cnt
+                                                poly_str = ";".join([f"{p[0][0]},{p[0][1]}" for p in cnt])
+
+                                    tank_num = None
+                                    for a_idx, arena in enumerate(all_arenas):
+                                        ax, ay, aw, ah = arena['x'], arena['y'], arena['w'], arena['h']
+                                        if arena['type'] == 'circle':
+                                            acx, acy, r_sq = ax+(aw/2), ay+(ah/2), ((aw+ah)/4)**2
+                                            if ((cx - acx)**2 + (cy - acy)**2) <= r_sq: tank_num = a_idx + 1; break
+                                        else:
+                                            if (ax <= cx <= ax + aw and ay <= cy <= ay + ah): tank_num = a_idx + 1; break
+                                    
+                                    if tank_num is not None:
+                                        det_dict = {
+                                            'frame_idx': frame_idx, 'tank_number': tank_num, 'class_name': class_names[cid],
+                                            'conf': conf, 'x1': b[0], 'y1': b[1], 'x2': b[2], 'y2': b[3],
+                                            'cx': cx, 'cy': cy, 'polygon': poly_str, 'poly_pts': poly_pts, 'cid': cid
+                                        }
+                                        raw_frame_data[frame_idx].append(det_dict)
+                                        
+                                        if inf_writer:
+                                            cv2.rectangle(frame, (int(b[0]), int(b[1])), (int(b[2]), int(b[3])), color, self.b_thick)
+                                            if poly_pts is not None:
+                                                cv2.drawContours(frame, [poly_pts], -1, color, max(1, self.b_thick - 1))
+                                            cv2.circle(frame, (int(cx), int(cy)), self.dot_sz, (0, 0, 255), -1)
+
+                            if inf_writer and frame is not None and frame.size > 0: 
+                                inf_writer.write(frame)
+                            
+                            frame_count_fps += 1
+                            curr_time = stopwatch.get_elapsed_time(as_float=True)
+                            if curr_time > fps_time + 1.0:
+                                current_fps = frame_count_fps / (curr_time - fps_time)
+                                frame_count_fps, fps_time = 0, curr_time
+
+                            if frame_idx % 5 == 0:
+                                pct = int((frame_idx + 1) * 100 / total_frames)
+                                self.progress_signal.emit(pct, f"Inference: {frame_idx}/{total_frames} | {current_fps:.1f} FPS | ETR: {stopwatch.get_etr(frame_idx, total_frames)}")
+                    finally:
+                        if inf_writer is not None: 
+                            inf_writer.release()
+                    
+                    if not self.is_running: break
+
+                    # ==============================================================
+                    # PHASE 2: BATCH PROCESSING (TRACKING & NMS)
+                    # ==============================================================
+                    self.log_signal.emit(f"\n--- [PHASE 2] Tracking & Optimization ---")
+                    
+                    self.log_signal.emit("Running NMS Duplication Merging...")
+                    clean_detections = self._merge_frame_duplicates_pre_tracking(raw_frame_data)
+                    
+                    tracked_detections = defaultdict(list)
+                    num_tanks = len(all_arenas)
+                    
+                    if self.config['method'] == "Custom Force-N":
+                        self.log_signal.emit("Applying Custom Force-N tracking...")
+                        active_tracks = {t: {} for t in range(1, num_tanks + 1)}
+                        for frame_idx in range(total_frames):
+                            dets_this_frame = clean_detections.get(frame_idx, [])
+                            for tank_num in range(1, num_tanks + 1):
+                                tank_dets = [d for d in dets_this_frame if d.get('tank_number') == tank_num]
+                                tank_dets.sort(key=lambda x: x.get('conf', 0.0), reverse=True)
+                                tank_dets = tank_dets[:self.config['max_n']]
+                                tank_active = active_tracks[tank_num]
+                                
+                                if len(tank_active) < self.config['max_n']:
+                                    unassigned_dets = []
+                                    for det in tank_dets:
+                                        new_id = len(tank_active) + 1
+                                        if new_id <= self.config['max_n']:
+                                            det['track_id'] = new_id
+                                            tank_active[new_id] = {'pos': (det['cx'], det['cy'])}
+                                            tracked_detections[frame_idx].append(det)
+                                        else: unassigned_dets.append(det)
+                                    tank_dets = unassigned_dets 
+                                
+                                if not tank_dets: continue 
+                                    
+                                track_ids = list(tank_active.keys())
+                                cost_matrix = np.full((len(track_ids), len(tank_dets)), 1e6) 
+                                for i, tid in enumerate(track_ids):
+                                    for j, det in enumerate(tank_dets):
+                                        cost_matrix[i, j] = np.hypot(tank_active[tid]['pos'][0] - det['cx'], tank_active[tid]['pos'][1] - det['cy'])
+
+                                # Safeguard: Sanitize NaNs and Infs to avoid SciPy C++ crash
+                                if np.any(np.isnan(cost_matrix)) or np.any(np.isinf(cost_matrix)):
+                                    cost_matrix = np.nan_to_num(cost_matrix, nan=1e6, posinf=1e6, neginf=1e6)
+
+                                try:
+                                    row_ind, col_ind = linear_sum_assignment(cost_matrix)
+                                except Exception as e:
+                                    self.log_signal.emit(f"⚠️ Tracking assignment error bypassed: {str(e)}")
+                                    row_ind, col_ind = [], []
+
+                                for r, c in zip(row_ind, col_ind):
+                                    tid = track_ids[r]; matched_det = tank_dets[c].copy()
+                                    matched_det['track_id'] = tid
+                                    tank_active[tid] = {'pos': (matched_det['cx'], matched_det['cy'])}
+                                    tracked_detections[frame_idx].append(matched_det)
+                                    
+                    elif self.config['method'] == "Confidence Filter":
+                        self.log_signal.emit("Applying Confidence Filter...")
+                        for frame_idx, dets in clean_detections.items():
+                            tank_groups = defaultdict(list)
+                            for det in dets: tank_groups[det.get('tank_number')].append(det)
+                            for tank_num, tank_dets in tank_groups.items():
+                                tank_dets.sort(key=lambda x: x.get('conf', 0.0), reverse=True)
+                                valid_dets = tank_dets[:self.config['max_n']]
+                                for i, d in enumerate(valid_dets):
+                                    d['track_id'] = i + 1
+                                    tracked_detections[frame_idx].append(d)
+
+                    if self.config['auto_stitch'] and self.config['method'] != "Custom Force-N":
+                        tracked_detections = self._force_stitch_to_max(tracked_detections)
+
+                    # ==============================================================
+                    # PHASE 3: RENDER VIDEO & ANALYTICS EXPORT
+                    # ==============================================================
+                    if self.config['save_video']:
+                        self.log_signal.emit(f"\n--- [PHASE 3] Rendering Tracked Video ---")
+                        v_cap = cv2.VideoCapture(v_path)
+                        trk_writer = cv2.VideoWriter(os.path.join(out_dir, f"{base_n}_tracked.mp4"),
+                                                     cv2.VideoWriter_fourcc(*'mp4v'), fps, (width, height))
+                        try:
+                            for f_idx in range(total_frames):
+                                if not self.is_running: break
+                                ret, frame = v_cap.read()
+                                if not ret or frame is None or frame.size == 0: 
+                                    break
+                                
+                                for d in tracked_detections.get(f_idx, []):
+                                    x1, y1, x2, y2 = map(int, [d['x1'], d['y1'], d['x2'], d['y2']])
+                                    cx, cy = int(d['cx']), int(d['cy'])
+                                    t_id = d.get('track_id', 0)
+                                    color = self.class_palette[int(d.get('cid', 0)) % len(self.class_palette)]
+                                    poly_pts = d.get('poly_pts', None)
+
+                                    cv2.rectangle(frame, (x1, y1), (x2, y2), color, self.b_thick)
+                                    if is_seg and poly_pts is not None:
+                                        ov = frame.copy()
+                                        cv2.fillPoly(ov, [poly_pts], color)
+                                        cv2.addWeighted(ov, 0.4, frame, 0.6, 0, frame)
+                                        cv2.drawContours(frame, [poly_pts], -1, color, max(1, self.b_thick - 1))
+                                    
+                                    cv2.circle(frame, (cx, cy), self.dot_sz, (0, 0, 255), -1)
+                                    
+                                    label = f"A{int(d['tank_number'])}|ID{t_id} {d['class_name']}"
+                                    (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_DUPLEX, self.l_scale, self.l_thick)
+                                    cv2.rectangle(frame, (x1, y1-th-10), (x1+tw+10, y1), color, -1)
+                                    cv2.putText(frame, label, (x1+5, y1-7), cv2.FONT_HERSHEY_DUPLEX, self.l_scale, (255,255,255), self.l_thick, cv2.LINE_AA)
+                                    
+                                trk_writer.write(frame)
+                                if f_idx % 10 == 0:
+                                    self.progress_signal.emit(int((f_idx + 1) * 100 / total_frames), f"Rendering: {f_idx}/{total_frames}")
+                        finally:
+                            v_cap.release()
+                            if trk_writer is not None: 
+                                trk_writer.release()
+
+                    if self.is_running:
+                        self.log_signal.emit("Exporting Analytics Data...")
+                        flat_data = [d for f, dets in tracked_detections.items() for d in dets]
+                        self._generate_analytics(base_n, flat_data, bg_frame, out_dir, width, height)
+                
+                except Exception as file_err:
+                    # Capture and handle individual video errors gracefully to ensure processing continues on subsequent files
+                    self.log_signal.emit(f"❌ Error encountered on file {base_n}: {str(file_err)}")
+                    print(f"=== INDIVIDUAL RUNTIME FILE ERROR: {base_n} ===")
+                    traceback.print_exc()
+                    continue
 
             time_str = time.strftime("%H:%M:%S", time.gmtime(time.time()-start_batch_time))
             self.finished_signal.emit(f"✅ Batch Completed in {time_str}")
@@ -609,6 +624,11 @@ class ArenaWorker(QThread):
                 for _, r in export_df.iterrows(): cv2.circle(accum, (int(r['X']), int(r['Y'])), 10, 0.4, -1)
                 accum = cv2.normalize(cv2.GaussianBlur(accum, (51, 51), 0), None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
                 heatmap = cv2.applyColorMap(accum, cv2.COLORMAP_JET)
-                cv2.imwrite(os.path.join(out, f"{base_n}_heatmap.png"), cv2.addWeighted(bg, 0.6, heatmap, 0.4, 0))
+                
+                # Check dimensions before overlaying to prevent segmentation faults due to mismatched dimensions
+                if bg.shape[:2] == heatmap.shape[:2]:
+                    cv2.imwrite(os.path.join(out, f"{base_n}_heatmap.png"), cv2.addWeighted(bg, 0.6, heatmap, 0.4, 0))
+                else:
+                    cv2.imwrite(os.path.join(out, f"{base_n}_heatmap.png"), heatmap)
             except Exception as e:
-                self.log_signal.emit(f"⚠️ Failed to save heatmap visual: {str(e)}") 
+                self.log_signal.emit(f"⚠️ Failed to save heatmap visual: {str(e)}")
