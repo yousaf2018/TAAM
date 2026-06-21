@@ -33,42 +33,46 @@ class SafeExcelFile(original_ExcelFile):
         sanitized_source = io_source
         if isinstance(io_source, str) and os.path.exists(io_source):
             try:
-                # Regex to match illegal XML control characters (0x00-0x08, 0x0B-0x0C, 0x0E-0x1F)
-                illegal_xml_re = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f]')
-                # Regex to safely replace raw '&' with '&amp;' unless it is already a valid entity
-                amp_xml_re = re.compile(r'&(?!amp;|lt;|gt;|quot;|apos;|#\d+;|#[xX][0-9a-fA-F]+;)')
-                
-                with open(io_source, 'rb') as f:
-                    file_bytes = f.read()
-                
-                # Sanitize XML inside the zip archive in-memory
-                in_zip = zipfile.ZipFile(io.BytesIO(file_bytes))
-                out_buffer = io.BytesIO()
-                with zipfile.ZipFile(out_buffer, 'w', zipfile.ZIP_DEFLATED) as out_zip:
-                    for item in in_zip.infolist():
-                        data = in_zip.read(item.filename)
-                        if item.filename.endswith('.xml') or item.filename.endswith('.rels'):
-                            try:
-                                # Safe multi-encoding decoding with ignore strategy for corrupt bytes
+                # Check if it is a valid zip file first to prevent zip decoding issues
+                if zipfile.is_zipfile(io_source) and os.path.getsize(io_source) > 0:
+                    # Regex to match illegal XML control characters (0x00-0x08, 0x0B-0x0C, 0x0E-0x1F)
+                    illegal_xml_re = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f]')
+                    # Regex to safely replace raw '&' with '&amp;' unless it is already a valid entity
+                    amp_xml_re = re.compile(r'&(?!amp;|lt;|gt;|quot;|apos;|#\d+;|#[xX][0-9a-fA-F]+;)')
+                    
+                    with open(io_source, 'rb') as f:
+                        file_bytes = f.read()
+                    
+                    # Sanitize XML inside the zip archive in-memory
+                    in_zip = zipfile.ZipFile(io.BytesIO(file_bytes))
+                    out_buffer = io.BytesIO()
+                    with zipfile.ZipFile(out_buffer, 'w', zipfile.ZIP_DEFLATED) as out_zip:
+                        for item in in_zip.infolist():
+                            data = in_zip.read(item.filename)
+                            if item.filename.endswith('.xml') or item.filename.endswith('.rels'):
                                 try:
-                                    xml_str = data.decode('utf-8', errors='ignore')
-                                except Exception:
-                                    xml_str = data.decode('utf-16', errors='ignore')
-                                    
-                                xml_str = illegal_xml_re.sub('', xml_str)
-                                xml_str = amp_xml_re.sub('&amp;', xml_str)
-                                data = xml_str.encode('utf-8')
-                            except Exception as parse_err:
-                                print(f"[TAAM SANITIZER] Sheet XML decode warning: {str(parse_err)}")
-                        out_zip.writestr(item, data)
-                out_buffer.seek(0)
-                sanitized_source = out_buffer
+                                    # Safe multi-encoding decoding with ignore strategy for corrupt bytes
+                                    try:
+                                        xml_str = data.decode('utf-8', errors='ignore')
+                                    except Exception:
+                                        xml_str = data.decode('utf-16', errors='ignore')
+                                        
+                                    xml_str = illegal_xml_re.sub('', xml_str)
+                                    xml_str = amp_xml_re.sub('&amp;', xml_str)
+                                    data = xml_str.encode('utf-8')
+                                except Exception as parse_err:
+                                    print(f"[TAAM SANITIZER] Sheet XML decode warning: {str(parse_err)}")
+                            out_zip.writestr(item, data)
+                    out_buffer.seek(0)
+                    sanitized_source = out_buffer
+                else:
+                    print(f"[TAAM SANITIZER] File is not a zip archive. Skipping XML sanitization.")
             except Exception as sanitization_error:
                 print(f"[TAAM SANITIZER ERROR] Failed to sanitize XML: {str(sanitization_error)}")
                 sanitized_source = io_source
 
-        # Cascade through safe reading engines
-        for eng in ["calamine", "openpyxl", None]:
+        # Cascade through safe reading engines including xlrd for legacy formats
+        for eng in ["calamine", "openpyxl", "xlrd", None]:
             try:
                 super().__init__(sanitized_source, engine=eng, storage_options=storage_options)
                 return
@@ -109,63 +113,70 @@ class AnalysisWorker(QThread):
             self.log_signal.emit(f"[TAAM IO] Started batch process for {len(files)} Excel file(s)...")
             
             for i, p in enumerate(files):
-                g_name = next(g for g, paths in self.experimental_groups.items() if p in paths) if hasattr(self, 'experimental_groups') else next(g for g, paths in self.groups.items() if p in paths)
                 source_basename = os.path.basename(p)
-                stems.append(os.path.splitext(source_basename)[0])
-                
-                # Active file status logger
-                self.log_signal.emit(f"\n[TAAM Math] Processing File ({i+1}/{len(files)}): {source_basename}")
-                
-                sum_list, kinetics_df = AnalysisEngine.calculate_behavior(
-                    p, self.config, self.arenas, self.arena_configs, self.log_signal
-                )
-                
-                # Temporary container to hold rows for the current file's individual export
-                indiv_sums = []
-                for s in sum_list:
-                    row = {"Group": g_name, "Source": source_basename, "Arena_ID": s["Arena_ID"]}
-                    for m in self.selected_metrics:
-                        if m in s: row[m] = s[m]
-                    all_sums.append(row)
-                    indiv_sums.append(row)
-                
-                if not kinetics_df.empty:
-                    kinetics_df.insert(0, 'Source', source_basename)
-                    kinetics_df.insert(0, 'Group', g_name)
-                    # removed global append to save system memory
-                
-                # --- SAVE INDIVIDUAL EXCEL FILE IN SEPARATE "Endpoints" FOLDER ---
-                endpoints_dir = os.path.join(self.workspace, "Endpoints")
-                os.makedirs(endpoints_dir, exist_ok=True)
-                
-                # Set proper output name from source file name
-                source_stem = os.path.splitext(source_basename)[0]
-                indiv_save_path = os.path.join(endpoints_dir, f"{source_stem}_processed.xlsx")
-                
-                df_indiv_summary = pd.DataFrame(indiv_sums)
-                
-                # Calculate the averages of all arenas for this specific file
-                if not df_indiv_summary.empty:
-                    self.log_signal.emit(f"      -> Calculating arena-wise averages...")
-                    numeric_cols_indiv = [c for c in df_indiv_summary.columns if c not in ["Group", "Source", "Arena_ID"]]
-                    df_indiv_mean = df_indiv_summary[numeric_cols_indiv].mean().to_frame().T
-                    df_indiv_mean.insert(0, 'Source', source_basename)
-                    df_indiv_mean.insert(0, 'Group', g_name)
-                    df_indiv_mean.insert(2, 'Aggregation_Type', 'AVERAGE')
-                else:
-                    df_indiv_mean = pd.DataFrame()
-                
-                self.log_signal.emit(f"      -> Writing worksheets for {source_basename}...")
-                with pd.ExcelWriter(indiv_save_path) as indiv_writer:
-                    if not df_indiv_mean.empty:
-                        df_indiv_mean.to_excel(indiv_writer, sheet_name="Arena_Averages", index=False)
-                    if not df_indiv_summary.empty:
-                        df_indiv_summary.to_excel(indiv_writer, sheet_name="Individual_Results", index=False)
+                try:
+                    g_name = next(g for g, paths in self.experimental_groups.items() if p in paths) if hasattr(self, 'experimental_groups') else next(g for g, paths in self.groups.items() if p in paths)
+                    stems.append(os.path.splitext(source_basename)[0])
+                    
+                    # Active file status logger
+                    self.log_signal.emit(f"\n[TAAM Math] Processing File ({i+1}/{len(files)}): {source_basename}")
+                    
+                    sum_list, kinetics_df = AnalysisEngine.calculate_behavior(
+                        p, self.config, self.arenas, self.arena_configs, self.log_signal
+                    )
+                    
+                    # Temporary container to hold rows for the current file's individual export
+                    indiv_sums = []
+                    for s in sum_list:
+                        row = {"Group": g_name, "Source": source_basename, "Arena_ID": s["Arena_ID"]}
+                        for m in self.selected_metrics:
+                            if m in s: row[m] = s[m]
+                        all_sums.append(row)
+                        indiv_sums.append(row)
+                    
                     if not kinetics_df.empty:
-                        kinetics_df.to_excel(indiv_writer, sheet_name="Frame_Wise_Kinetics", index=False)
-                
-                self.log_signal.emit(f"      -> Saved individual processed file: Endpoints/{os.path.basename(indiv_save_path)}")
-                # -----------------------------------------------------------------
+                        kinetics_df.insert(0, 'Source', source_basename)
+                        kinetics_df.insert(0, 'Group', g_name)
+                    
+                    # --- SAVE INDIVIDUAL EXCEL FILE IN SEPARATE "Endpoints" FOLDER ---
+                    endpoints_dir = os.path.join(self.workspace, "Endpoints")
+                    os.makedirs(endpoints_dir, exist_ok=True)
+                    
+                    # Set proper output name from source file name
+                    source_stem = os.path.splitext(source_basename)[0]
+                    indiv_save_path = os.path.join(endpoints_dir, f"{source_stem}_processed.xlsx")
+                    
+                    df_indiv_summary = pd.DataFrame(indiv_sums)
+                    
+                    # Calculate the averages of all arenas for this specific file
+                    if not df_indiv_summary.empty:
+                        self.log_signal.emit(f"      -> Calculating arena-wise averages...")
+                        numeric_cols_indiv = [c for c in df_indiv_summary.columns if c not in ["Group", "Source", "Arena_ID"]]
+                        df_indiv_mean = df_indiv_summary[numeric_cols_indiv].mean().to_frame().T
+                        df_indiv_mean.insert(0, 'Source', source_basename)
+                        df_indiv_mean.insert(0, 'Group', g_name)
+                        df_indiv_mean.insert(2, 'Aggregation_Type', 'AVERAGE')
+                    else:
+                        df_indiv_mean = pd.DataFrame()
+                    
+                    # Verify we actually have data sheets to write to avoid creating empty/corrupt zip files
+                    if not df_indiv_mean.empty or not df_indiv_summary.empty or not kinetics_df.empty:
+                        self.log_signal.emit(f"      -> Writing worksheets for {source_basename}...")
+                        with pd.ExcelWriter(indiv_save_path) as indiv_writer:
+                            if not df_indiv_mean.empty:
+                                df_indiv_mean.to_excel(indiv_writer, sheet_name="Arena_Averages", index=False)
+                            if not df_indiv_summary.empty:
+                                df_indiv_summary.to_excel(indiv_writer, sheet_name="Individual_Results", index=False)
+                            if not kinetics_df.empty:
+                                kinetics_df.to_excel(indiv_writer, sheet_name="Frame_Wise_Kinetics", index=False)
+                        self.log_signal.emit(f"      -> Saved individual processed file: Endpoints/{os.path.basename(indiv_save_path)}")
+                    else:
+                        self.log_signal.emit(f"      -> Warning: No behavioral endpoints extracted for {source_basename}. Skip writing file.")
+                        
+                except Exception as file_err:
+                    self.log_signal.emit(f"\n[TAAM ERROR] Skipping file {source_basename} due to processing error: {str(file_err)}")
+                    import traceback
+                    self.log_signal.emit(traceback.format_exc())
                 
                 self.progress_signal.emit(int(((i+1)/len(files))*100))
 
@@ -195,6 +206,9 @@ class AnalysisWorker(QThread):
 
                 self.log_signal.emit(f"[TAAM IO] Master Aggregated Workbook generated safely.")
                 self.finished_signal.emit(f"Success! TAAM Data exported safely to {name}")
+            else:
+                self.log_signal.emit(f"\n[TAAM WARNING] No operational files were successfully processed. Master report skipped.")
+                self.finished_signal.emit("Process completed, but no analytical data could be salvaged from the imported source files.")
         except Exception as e:
             import traceback
             exc_type, exc_value, exc_tb = sys.exc_info()

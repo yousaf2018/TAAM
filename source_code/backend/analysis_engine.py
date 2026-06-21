@@ -1,5 +1,6 @@
-import os, cv2, torch, numpy as np, shutil, glob, csv, gc, sys, random, pandas as pd
+import os, cv2, torch, numpy as np, pandas as pd
 import math
+import zipfile  # Needed for zip file validation checks
 from scipy.stats import linregress
 
 class AnalysisEngine:
@@ -11,7 +12,28 @@ class AnalysisEngine:
         r_thr = float(config.get('rapid_thresh', 3.0))
         
         results_summary, raw_kinetics = [], []
-        xl = pd.ExcelFile(xlsx_path)
+
+        # --- PRE-READ INTEGRITY CHECK FOR CRIPPLED ZIP FILES ---
+        if not os.path.exists(xlsx_path):
+            logger.emit(f"      [TAAM Math ERROR] File path does not exist: {xlsx_path}")
+            return [], pd.DataFrame()
+            
+        if os.path.getsize(xlsx_path) == 0:
+            logger.emit(f"      [TAAM Math ERROR] File is empty (0 bytes): {os.path.basename(xlsx_path)}")
+            return [], pd.DataFrame()
+
+        # Check if the filename claims to be a zipped OpenXML format and has zip integrity
+        if xlsx_path.lower().endswith(('.xlsx', '.xlsm', '.xltx', '.xltm', '.xlsx_processed')):
+            if not zipfile.is_zipfile(xlsx_path):
+                logger.emit(f"      [TAAM Math WARNING] File '{os.path.basename(xlsx_path)}' has a zipped Excel extension but is not a valid zip archive (corrupt, empty, or locked). Skipping.")
+                return [], pd.DataFrame()
+
+        try:
+            xl = pd.ExcelFile(xlsx_path)
+        except Exception as file_read_err:
+            logger.emit(f"      [TAAM Math ERROR] Failed to load workbook '{os.path.basename(xlsx_path)}': {str(file_read_err)}")
+            return [], pd.DataFrame()
+
         sheet_names = xl.sheet_names
 
         for i, roi in enumerate(roi_list):
@@ -53,9 +75,9 @@ class AnalysisEngine:
             try:
                 z16_val = int(tdf.iloc[14, 25])
                 if np.isnan(z16_val):
-                    z16_val = 1
+                    z16_val = 5
             except Exception:
-                z16_val = 1
+                z16_val = 5
 
             # 1. KINEMATICS (Calculated for EACH individual animal)
             if id_col:
@@ -98,32 +120,54 @@ class AnalysisEngine:
             if id_col: tdf.loc[is_first, 'is_top'] = 0
             else: tdf.loc[tdf.index[0], 'is_top'] = 0
 
-            # 4. COMPLEXITY (Slicing on consecutive 15,000 blocks)
+            # 4. COMPLEXITY (Optimized Dual Slicing)
             fd_list, ent_list = [], []
             slice_size = 15000
 
             if id_col:
                 for _, sub_df in tdf.groupby(id_col):
-                    fd_slices, ent_slices = [], []
+                    dr_global = sub_df['dr'].values
+                    
+                    # A. Fractal Dimension on globally pre-calculated displacement array (keeps 0.0 values)
+                    fd_slices = []
+                    for start_idx in range(0, len(dr_global), slice_size):
+                        slice_dr = dr_global[start_idx : start_idx + slice_size]
+                        if len(slice_dr) >= 50:
+                            fd_slices.append(AnalysisEngine._calc_excel_fd(slice_dr, S_values, aa9_val, z16_val))
+                    
+                    # B. Entropy on sliced coordinates to match Excel's row-gap offsets exactly
+                    ent_slices = []
                     for start_idx in range(0, len(sub_df), slice_size):
                         slice_df = sub_df.iloc[start_idx : start_idx + slice_size]
-                        if len(slice_df) < 50: 
-                            continue
-                        
-                        fd_slices.append(AnalysisEngine._calc_excel_fd(slice_df['dr'].values, S_values, aa9_val, z16_val))
-                        ent_slices.append(AnalysisEngine._calc_ent(slice_df['dx'].values, slice_df['dy'].values, slice_df['dr'].values))
+                        if len(slice_df) >= 50:
+                            ent_slices.append(AnalysisEngine._calc_ent(
+                                slice_df['dx'].values, 
+                                slice_df['dy'].values, 
+                                slice_df['dr'].values
+                            ))
                     
                     fd_list.append(np.mean(fd_slices) if fd_slices else 1.000)
                     ent_list.append(np.mean(ent_slices) if ent_slices else 1.009)
             else:
-                fd_slices, ent_slices = [], []
+                dr_global = tdf['dr'].values
+                
+                # A. Fractal Dimension on globally pre-calculated displacement array (keeps 0.0 values)
+                fd_slices = []
+                for start_idx in range(0, len(dr_global), slice_size):
+                    slice_dr = dr_global[start_idx : start_idx + slice_size]
+                    if len(slice_dr) >= 50:
+                        fd_slices.append(AnalysisEngine._calc_excel_fd(slice_dr, S_values, aa9_val, z16_val))
+                
+                # B. Entropy on sliced coordinates to match Excel's row-gap offsets exactly
+                ent_slices = []
                 for start_idx in range(0, len(tdf), slice_size):
                     slice_df = tdf.iloc[start_idx : start_idx + slice_size]
-                    if len(slice_df) < 50: 
-                        continue
-                    
-                    fd_slices.append(AnalysisEngine._calc_excel_fd(slice_df['dr'].values, S_values, aa9_val, z16_val))
-                    ent_slices.append(AnalysisEngine._calc_ent(slice_df['dx'].values, slice_df['dy'].values, slice_df['dr'].values))
+                    if len(slice_df) >= 50:
+                        ent_slices.append(AnalysisEngine._calc_ent(
+                            slice_df['dx'].values, 
+                            slice_df['dy'].values, 
+                            slice_df['dr'].values
+                        ))
                 
                 fd_list.append(np.mean(fd_slices) if fd_slices else 1.000)
                 ent_list.append(np.mean(ent_slices) if ent_slices else 1.009)
@@ -164,19 +208,22 @@ class AnalysisEngine:
         """Calculates Shannon Entropy matching turning angle column R and cell AD6"""
         try:
             with np.errstate(invalid='ignore', divide='ignore'):
-                dot = dx[2:]*dx[1:-1] + dy[2:]*dy[1:-1]  # TYPO FIXED
+                dot = dx[2:]*dx[1:-1] + dy[2:]*dy[1:-1]  # consecutive vectors
                 denom = dr[1:-1] * dr[2:]
                 cos_v = np.clip(np.where(denom > 0, dot/denom, np.nan), -1.0, 1.0)
                 theta = np.arccos(cos_v)*(180.0/np.pi)
             
-            v = theta[~np.isnan(theta)]
+            # Excel's COUNTA(R4:R15001) is exactly len(dx) - 2 (total possible slots)
+            M = len(dx) - 2
+            if M <= 0: 
+                return 1.009
             
-            # COUNTA(R4:R15001) evaluates every cell in the range (exactly len - 2)
-            total_angles = len(dx) - 2
-            if total_angles <= 0: return 1.009
+            # Replicates Excel's cell-registry limits by using a double-precision float epsilon
+            M1 = np.sum(theta >= (90.0 - 1e-9))
+            M2 = np.sum(theta < (90.0 - 1e-9))
             
-            p1 = np.sum(v >= 90.0) / total_angles
-            p2 = np.sum(v < 90.0) / total_angles
+            p1 = M1 / M
+            p2 = M2 / M
             
             return ((-p1*math.log2(p1) if p1>0 else 0) + (-p2*math.log2(p2) if p2>0 else 0))
         except:
@@ -184,17 +231,18 @@ class AnalysisEngine:
 
     @staticmethod
     def _calc_excel_fd(dr_array, S_values, aa9_val, z16_val):
-        """Calculates Fractal Dimension over the dynamic regression window match of Excel"""
+        """Calculates Fractal Dimension over the strict centered regression window of Excel"""
         try:
+            # Drop NaN values, but KEEP 0.0 values (just like Excel's Q column!)
             q = dr_array[~np.isnan(dr_array)]
-            q = q[q > 0]
             if len(q) < 50: 
                 return 1.000
 
-            # Fallback in case S_values was not loaded from Excel column S
+            # Fallback in case S_values was not loaded from Excel column S (recreates linear sequence r)
             if len(S_values) == 0:
-                S_values = np.sort(np.unique(q))
-                if len(S_values) < 26: return 1.000
+                S_values = np.arange(0.1, 185.1, 0.1)
+                if len(S_values) >= 10:
+                    S_values[9] = 1.01  # Set S11 exactly to 1.01 matching your sheet
 
             log_S = np.log10(S_values)
             log_V = []
@@ -208,32 +256,24 @@ class AnalysisEngine:
 
             log_V = np.array(log_V)
 
-            # Replicate Excel match logic to find AA10, AA11, AA12, and AA13
-            # COUNTIF(log_S, <= aa9)
-            count_le = np.sum(log_S <= aa9_val)
-            aa10_val = log_S[count_le - 1] if count_le > 0 else log_S[0]
+            # Match Excel AA9 fallback value (typically 0.0, representing scale 1.01 / 1.0)
+            if aa9_val is None or aa9_val == 0.0:
+                aa9_val = 0.0
 
-            # COUNTIF(log_S, >= aa9)
-            count_ge = np.sum(log_S >= aa9_val)
-            aa11_val = log_S[len(log_S) - count_ge] if count_ge > 0 else log_S[-1]
+            # Find the closest match index (0-based) in log_S for aa9_val
+            match_idx = np.argmin(np.abs(log_S - aa9_val))
 
-            # AA12 = MIN(AA10, AA11)
-            aa12_val = min(aa10_val, aa11_val)
+            # Excel uses an 11-point window centered around match_idx (using Column Z offsets -5 to 5)
+            # Row 16 of the table corresponds to offset +5 (index match_idx + 5)
+            # Row 26 of the table corresponds to offset -5 (index match_idx - 5)
+            if z16_val is None or z16_val == 0:
+                z16_val = 5
 
-            # MATCH(AA12, log_S) (1-based index)
-            # Safe float lookup using argmin to eliminate floating point mismatch errors
-            match_idx = np.argmin(np.abs(log_S - aa12_val))
-            aa13_val = int(match_idx) + 1
-
-            # Determine the exact start position of the 11-point regression window
-            start_idx = aa13_val + z16_val - 1
+            start_idx = match_idx + z16_val - 1
             
-            # Boundary check
-            if start_idx + 11 > len(log_S):
-                start_idx = max(0, len(log_S) - 11)
-
-            x_window = log_S[start_idx : start_idx + 11]
-            y_window = log_V[start_idx : start_idx + 11]
+            # Regression is done over the 11 points centered around start_idx (extending down from start_idx)
+            x_window = log_S[start_idx - 10 : start_idx + 1]
+            y_window = log_V[start_idx - 10 : start_idx + 1]
 
             # Drop inf values if any exist in the edge scaling window
             valid_mask = ~np.isinf(y_window)
