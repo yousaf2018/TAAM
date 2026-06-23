@@ -89,8 +89,6 @@ class SplitterWorker(QThread):
         threshold = self.daynight_config['threshold']
         day_chunk_sec = self.daynight_config['day_chunk']
         night_chunk_sec = self.daynight_config['night_chunk']
-        day_dir = self.daynight_config.get('day_dir', 'backward')
-        night_dir = self.daynight_config.get('night_dir', 'forward')
 
         self.log_signal.emit(f"Running Multi-Transition Split. Threshold: {threshold}")
 
@@ -183,14 +181,19 @@ class SplitterWorker(QThread):
                 label = f"day{day_counter}"
                 day_counter += 1
                 chunk_frames = day_chunk_frames
-                direction = day_dir
             else:
                 label = f"night{night_counter}"
                 night_counter += 1
                 chunk_frames = night_chunk_frames
-                direction = night_dir
 
-            self.log_signal.emit(f"Segment {i+1}: Frames {seg_start} to {seg_end} chunked as [{label.upper()}] using {direction} alignment.")
+            # STRICT OVERRIDE RULE:
+            # day1 uses backward chunking; all other phases (night1, day2, night2, etc.) use forward chunking.
+            if label == "day1":
+                direction = "backward"
+            else:
+                direction = "forward"
+
+            self.log_signal.emit(f"Segment {i+1}: Frames {seg_start} to {seg_end} chunked as [{label.upper()}] using strict {direction.upper()} alignment.")
             seg_chunks = generate_segment_chunks(seg_start, seg_end, chunk_frames, direction, label)
             chunks.extend(seg_chunks)
 
@@ -238,6 +241,7 @@ class SplitterWorker(QThread):
 
             subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             self.msleep(50)
+
     def export_sequential(self, cap, chunks, base_name, total_frames, fps):
         """Sequential single-pass writing with chronological directory sorting using original FPS."""
         num_chunks = len(chunks)
@@ -293,4 +297,4 @@ class SplitterWorker(QThread):
                 self.msleep(1)
 
         if writer is not None:
-            writer.release()    
+            writer.release()

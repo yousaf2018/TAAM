@@ -1,5 +1,5 @@
 import os, sys, cv2, json, math, pandas as pd, numpy as np
-import zipfile, io, re  # Added for XML sanitization
+import zipfile, io, re
 
 # PyQt6 Graphic User Interface Imports
 from PyQt6.QtWidgets import *
@@ -171,7 +171,16 @@ class AnalysisWorker(QThread):
                                 kinetics_df.to_excel(indiv_writer, sheet_name="Frame_Wise_Kinetics", index=False)
                         self.log_signal.emit(f"      -> Saved individual processed file: Endpoints/{os.path.basename(indiv_save_path)}")
                     else:
-                        self.log_signal.emit(f"      -> Warning: No behavioral endpoints extracted for {source_basename}. Skip writing file.")
+                        # Fallback for when kinetics DataFrame is disabled but summaries exist
+                        if not df_indiv_mean.empty or not df_indiv_summary.empty:
+                            with pd.ExcelWriter(indiv_save_path) as indiv_writer:
+                                if not df_indiv_mean.empty:
+                                    df_indiv_mean.to_excel(indiv_writer, sheet_name="Arena_Averages", index=False)
+                                if not df_indiv_summary.empty:
+                                    df_indiv_summary.to_excel(indiv_writer, sheet_name="Individual_Results", index=False)
+                            self.log_signal.emit(f"      -> Saved summary tables only: Endpoints/{os.path.basename(indiv_save_path)}")
+                        else:
+                            self.log_signal.emit(f"      -> Warning: No behavioral endpoints extracted for {source_basename}. Skip writing file.")
                         
                 except Exception as file_err:
                     self.log_signal.emit(f"\n[TAAM ERROR] Skipping file {source_basename} due to processing error: {str(file_err)}")
@@ -235,7 +244,7 @@ class AnalysisModule(QDialog):
     def __init__(self, workspace, parent=None):
         super().__init__(parent)
         self.setWindowTitle("TAAM | Advanced Scientific Analytics Suite")
-        self.resize(1650, 950); self.workspace = os.path.abspath(workspace)
+        self.resize(1650, 880); self.workspace = os.path.abspath(workspace)
         self.experimental_groups, self.arenas, self.arena_configs = {}, [], {}
         self.video_frame, self.video_path_stored = None, ""
         self.metric_checkboxes = {}
@@ -244,7 +253,7 @@ class AnalysisModule(QDialog):
             QDialog { background-color: #050505; }
             QWidget { background-color: #050505; color: #efefef; font-family: 'Segoe UI'; }
             QFrame#Sidebar { background-color: #0d0d0d; border-right: 1px solid #333; }
-            QGroupBox { border: 1px solid #333; margin-top: 10px; font-weight: bold; color: #0078d4; }
+            QGroupBox { border: 1px solid #333; margin-top: 10px; padding-top: 18px; font-weight: bold; color: #0078d4; }
             QPushButton { background-color: #0078d4; border: none; padding: 10px; font-weight: bold; border-radius: 4px; color: white; cursor: pointinghand; }
             QPushButton:hover { background-color: #008af0; }
             QLineEdit, QDoubleSpinBox, QComboBox { background: #1a1a1a; border: 1px solid #333; padding: 5px; color: #39FF14; }
@@ -262,14 +271,30 @@ class AnalysisModule(QDialog):
 
     def init_ui(self):
         self.main_layout = QHBoxLayout(self)
+        self.main_layout.setContentsMargins(10, 10, 10, 10)
+        self.main_layout.setSpacing(10)
+        
         sidebar = QVBoxLayout()
+        sidebar.setSpacing(5)
         
         g1 = QGroupBox("1. Scientific Parameters")
         pl = QFormLayout()
+        pl.setVerticalSpacing(4)
+        
         self.sp_conv = self._make_prec_spin(18.74); self.sp_fps = self._make_prec_spin(24.99); self.sp_dur = self._make_prec_spin(3549.7)
         self.sp_frz = self._make_prec_spin(0.1); self.sp_rpd = self._make_prec_spin(3.0)
-        pl.addRow("Conversion:", self.sp_conv); pl.addRow("FPS:", self.sp_fps); pl.addRow("Duration (Legacy):", self.sp_dur)
-        pl.addRow("Freezing (cm/s):", self.sp_frz); pl.addRow("Rapid (cm/s):", self.sp_rpd)
+        self.sp_body_len = self._make_prec_spin(3.0)
+        self.sp_frz_bl = self._make_prec_spin(0.05)
+        self.sp_rpd_bl = self._make_prec_spin(1.0)
+        
+        pl.addRow("Conversion (px/cm):", self.sp_conv)
+        pl.addRow("FPS:", self.sp_fps)
+        pl.addRow("Duration (Legacy):", self.sp_dur)
+        pl.addRow("Body Length (cm):", self.sp_body_len)
+        pl.addRow("Freezing (cm/s):", self.sp_frz)
+        pl.addRow("Rapid (cm/s):", self.sp_rpd)
+        pl.addRow("Freezing (body-length/s):", self.sp_frz_bl)
+        pl.addRow("Rapid (body-length/s):", self.sp_rpd_bl)
         g1.setLayout(pl); sidebar.addWidget(g1)
 
         g2 = QGroupBox("2. Settings Persistence")
@@ -277,20 +302,54 @@ class AnalysisModule(QDialog):
         g2.setLayout(sl); sidebar.addWidget(g2)
 
         g3 = QGroupBox("3. Grouping Manager")
-        gl = QVBoxLayout(); self.list_groups = QListWidget(); self.list_files = QListWidget(); self.list_groups.itemClicked.connect(self.update_file_list)
-        btn_r = QHBoxLayout(); btn_r.addWidget(self._make_btn("+ Group", self.add_group)); btn_r.addWidget(self._make_btn("+ Excel", self.add_xlsx))
-        gl.addWidget(QLabel("Groups:")); gl.addWidget(self.list_groups); gl.addWidget(QLabel("Excel Files:")); gl.addWidget(self.list_files); gl.addLayout(btn_r); gl.addWidget(self._make_btn("Remove Item", self.remove_item))
+        gl = QVBoxLayout()
+        
+        self.list_groups = QListWidget(); self.list_groups.setMaximumHeight(100)
+        self.list_files = QListWidget(); self.list_files.setMaximumHeight(100)
+        self.list_groups.itemClicked.connect(self.update_file_list)
+        
+        btn_r = QHBoxLayout()
+        btn_r.addWidget(self._make_btn("+ Group", self.add_group))
+        btn_r.addWidget(self._make_btn("+ Excel", self.add_xlsx))
+        
+        gl.addWidget(QLabel("Groups:")); gl.addWidget(self.list_groups)
+        gl.addWidget(QLabel("Excel Files:")); gl.addWidget(self.list_files)
+        gl.addLayout(btn_r); gl.addWidget(self._make_btn("Remove Item", self.remove_item))
         g3.setLayout(gl); sidebar.addWidget(g3); sidebar.addStretch(); self.main_layout.addLayout(sidebar, 1)
 
         content = QVBoxLayout()
+        content.setSpacing(5)
+        
         g4 = QGroupBox("4. Behavioral Endpoints Selection")
         ml = QGridLayout()
-        m_list = ["Average Speed (cm/s)", "Freezing Time Ratio (%)", "Swimming Time Ratio (%)", "Rapid movement time ratio (%)", "Time in Top Percentage (%)", "Time in Bottom Percentage (%)", "Average Thigmotaxis (cm)", "Fractal Dimension", "Entropy"]
+        m_list = [
+            "Average Speed (cm/s)", 
+            "Freezing Time Ratio (%)", 
+            "Swimming Time Ratio (%)", 
+            "Rapid movement time ratio (%)", 
+            "Time in Top Percentage (%)", 
+            "Time in Bottom Percentage (%)", 
+            "Average Thigmotaxis (cm)", 
+            "Fractal Dimension", 
+            "Entropy",
+            "Average Speed (body-length/s)",
+            "Freezing Time Ratio (body-length/s) (%)",
+            "Swimming Time Ratio (body-length/s) (%)",
+            "Rapid movement time ratio (body-length/s) (%)"
+        ]
         for i, m in enumerate(m_list):
             cb = QCheckBox(m); cb.setChecked(True); self.metric_checkboxes[m] = cb; ml.addWidget(cb, i//3, i%3); cb.setCursor(Qt.CursorShape.PointingHandCursor)
+        
+        # Added a standalone execution modifier check for frame-wise coordinates export
+        self.cb_export_kinetics = QCheckBox("Calculate & Export Frame-Wise Kinetics Sheet (Slower)")
+        self.cb_export_kinetics.setChecked(True)
+        self.cb_export_kinetics.setStyleSheet("color: #ffc107; font-weight: bold; margin-top: 5px;")
+        self.cb_export_kinetics.setCursor(Qt.CursorShape.PointingHandCursor)
+        ml.addWidget(self.cb_export_kinetics, 5, 0, 1, 3)
+        
         g4.setLayout(ml); content.addWidget(g4)
 
-        self.view_label = QLabel("TAAM Visualizer Window"); self.view_label.setFixedSize(800, 450); self.view_label.setStyleSheet("background:black; border:2px solid #0078d4;"); self.view_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.view_label = QLabel("TAAM Visualizer Window"); self.view_label.setFixedSize(711, 400); self.view_label.setStyleSheet("background:black; border:2px solid #0078d4;"); self.view_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         content.addWidget(self.view_label, 0, Qt.AlignmentFlag.AlignCenter)
 
         g5 = QGroupBox("5. Centroid Calibration")
@@ -302,18 +361,27 @@ class AnalysisModule(QDialog):
         cl.addWidget(QLabel("Center X%")); cl.addWidget(self.sld_x); cl.addWidget(QLabel("Center Y%")); cl.addWidget(self.sld_y); g5.setLayout(cl); content.addWidget(g5)
 
         self.prog_bar = QProgressBar(); content.addWidget(self.prog_bar)
-        self.console = QTextEdit(); self.console.setObjectName("Console"); self.console.setReadOnly(True); self.console.setFixedHeight(100); content.addWidget(self.console)
+        self.console = QTextEdit(); self.console.setObjectName("Console"); self.console.setReadOnly(True); self.console.setFixedHeight(80); content.addWidget(self.console)
 
         bl2 = QHBoxLayout(); bl2.addWidget(self._make_btn("Load Video", self.load_video)); bl2.addWidget(self._make_btn("Load ROI JSON", self.load_roi))
         content.addLayout(bl2)
 
-        self.btn_go = QPushButton("LAUNCH SCIENTIFIC EXCEL EXPORT"); self.btn_go.setFixedHeight(70); self.btn_go.setStyleSheet("background:#28a745; font-size: 18px;"); self.btn_go.clicked.connect(self.run_extraction)
+        self.btn_go = QPushButton("LAUNCH SCIENTIFIC EXCEL EXPORT"); self.btn_go.setFixedHeight(50); self.btn_go.setStyleSheet("background:#28a745; font-size: 18px;"); self.btn_go.clicked.connect(self.run_extraction)
         content.addWidget(self.btn_go); self.main_layout.addLayout(content, 3)
 
     def run_extraction(self):
         if not self.experimental_groups or not self.arenas: QMessageBox.warning(self, "Audit", "Add groups and load ROI first."); return
         self.btn_go.setEnabled(False); self.console.clear()
-        cfg = {'fps': self.sp_fps.value(), 'conversion': self.sp_conv.value(), 'freeze_thresh': self.sp_frz.value(), 'rapid_thresh': self.sp_rpd.value()}
+        cfg = {
+            'fps': self.sp_fps.value(), 
+            'conversion': self.sp_conv.value(), 
+            'freeze_thresh': self.sp_frz.value(), 
+            'rapid_thresh': self.sp_rpd.value(),
+            'body_length': self.sp_body_len.value(),
+            'freeze_thresh_bl': self.sp_frz_bl.value(),
+            'rapid_thresh_bl': self.sp_rpd_bl.value(),
+            'export_kinetics': self.cb_export_kinetics.isChecked()
+        }
         metrics = [k for k,v in self.metric_checkboxes.items() if v.isChecked()]
         
         self.worker = AnalysisWorker(self.experimental_groups, self.arenas, self.arena_configs, cfg, metrics, self.workspace)
@@ -321,7 +389,24 @@ class AnalysisModule(QDialog):
         self.worker.finished_signal.connect(lambda m: (self.btn_go.setEnabled(True), QMessageBox.information(self, "TAAM Analysis", m))); self.worker.start()
 
     def save_settings(self):
-        data = {"params": {"conv": self.sp_conv.value(), "fps": self.sp_fps.value(), "dur": self.sp_dur.value(), "frz": self.sp_frz.value(), "rpd": self.sp_rpd.value()}, "arenas": self.arena_configs, "groups": self.experimental_groups, "video": self.video_path_stored, "roi": self.arenas, "metrics": [k for k,v in self.metric_checkboxes.items() if v.isChecked()]}
+        data = {
+            "params": {
+                "conv": self.sp_conv.value(), 
+                "fps": self.sp_fps.value(), 
+                "dur": self.sp_dur.value(), 
+                "frz": self.sp_frz.value(), 
+                "rpd": self.sp_rpd.value(),
+                "body_len": self.sp_body_len.value(),
+                "frz_bl": self.sp_frz_bl.value(),
+                "rpd_bl": self.sp_rpd_bl.value(),
+                "export_kinetics": self.cb_export_kinetics.isChecked()
+            }, 
+            "arenas": self.arena_configs, 
+            "groups": self.experimental_groups, 
+            "video": self.video_path_stored, 
+            "roi": self.arenas, 
+            "metrics": [k for k,v in self.metric_checkboxes.items() if v.isChecked()]
+        }
         with open(os.path.join(self.workspace, "endpoints.json"), 'w') as f: json.dump(data, f, indent=4); self.console.append("TAAM endpoints.json saved.")
 
     def load_settings(self):
@@ -332,10 +417,23 @@ class AnalysisModule(QDialog):
                 d = json.load(f); pr = d.get('params', {})
                 self.sp_conv.setValue(pr.get('conv', 18.74)); self.sp_fps.setValue(pr.get('fps', 24.99)); self.sp_dur.setValue(pr.get('dur', 3549.7))
                 self.sp_frz.setValue(pr.get('frz', 0.1)); self.sp_rpd.setValue(pr.get('rpd', 3.0))
+                self.sp_body_len.setValue(pr.get('body_len', 3.0))
+                self.sp_frz_bl.setValue(pr.get('frz_bl', 0.05))
+                self.sp_rpd_bl.setValue(pr.get('rpd_bl', 1.0))
+                self.cb_export_kinetics.setChecked(pr.get('export_kinetics', True))
                 self.arena_configs = {int(k): v for k,v in d.get('arenas', {}).items()}
                 self.experimental_groups = d.get('groups', {}); self.arenas = d.get('roi', []); self.video_path_stored = d.get('video', "")
+                
+                # Dynamic Checkbox Loading & Migration Protection for body-length/s
                 m_list = d.get('metrics', [])
-                for k,v in self.metric_checkboxes.items(): v.setChecked(k in m_list)
+                if m_list:
+                    for k, v in self.metric_checkboxes.items():
+                        # Default new body-length/s metrics to checked if loading an older settings file
+                        if k in m_list or ("body-length/s" in k and not any("body-length/s" in m for m in m_list)):
+                            v.setChecked(True)
+                        else:
+                            v.setChecked(False)
+                            
             self.list_groups.clear(); self.list_groups.addItems(self.experimental_groups.keys()); self.combo_arena.clear(); self.combo_arena.addItems([f"Arena {i+1}" for i in range(len(self.arenas))])
             if self.video_path_stored and os.path.exists(self.video_path_stored):
                 cap = cv2.VideoCapture(self.video_path_stored); stat, f = cap.read(); cap.release(); self.video_frame = f if stat else None

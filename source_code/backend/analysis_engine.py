@@ -11,6 +11,14 @@ class AnalysisEngine:
         f_thr = float(config.get('freeze_thresh', 0.1))
         r_thr = float(config.get('rapid_thresh', 3.0))
         
+        # Body length conversion settings
+        body_length_cm = float(config.get('body_length', 3.0))
+        f_thr_bl = float(config.get('freeze_thresh_bl', 0.05))
+        r_thr_bl = float(config.get('rapid_thresh_bl', 1.0))
+        
+        # Performance check: If True, returns full frame-by-frame data. If False, skips allocation.
+        export_kinetics = config.get('export_kinetics', True)
+        
         results_summary, raw_kinetics = [], []
 
         # --- PRE-READ INTEGRITY CHECK FOR CRIPPLED ZIP FILES ---
@@ -57,13 +65,11 @@ class AnalysisEngine:
             id_col = next((c for c in id_cols if c in tdf.columns), None)
 
             # --- DYNAMIC PARAMETER EXTRACTION FROM THE WORKBOOK ---
-            # Extract scale column S (19th column, index 18)
             try:
                 S_values = pd.to_numeric(tdf.iloc[:, 18], errors='coerce').dropna().values
             except Exception:
                 S_values = np.array([])
 
-            # Extract AA9 (Column AA index 26, Row 9 index 7)
             try:
                 aa9_val = float(tdf.iloc[7, 26])
                 if np.isnan(aa9_val):
@@ -71,7 +77,6 @@ class AnalysisEngine:
             except Exception:
                 aa9_val = 0.0
 
-            # Extract Z16 (Column Z index 25, Row 16 index 14)
             try:
                 z16_val = int(tdf.iloc[14, 25])
                 if np.isnan(z16_val):
@@ -92,12 +97,21 @@ class AnalysisEngine:
             tdf['dr'] = np.sqrt(tdf['dx']**2 + tdf['dy']**2)
             tdf['speed'] = (tdf['dr'] / px_per_cm) * fps
             tdf['speed'] = np.where(tdf['speed'] >= 50.0, np.nan, tdf['speed'])
+            
+            # Speed scaling relative to the specimen's body length
+            tdf['speed_bl'] = tdf['speed'] / body_length_cm
 
-            # 2. BEHAVIORAL STATES
+            # 2. BEHAVIORAL STATES (Standard cm/s boundaries)
             spd_clean = tdf['speed'].fillna(50.0).values
             tdf['freezing'] = (spd_clean < f_thr).astype(int)
             tdf['swimming'] = ((spd_clean >= f_thr) & (spd_clean < r_thr)).astype(int)
             tdf['rapid'] = (spd_clean >= r_thr).astype(int)
+
+            # 2b. BEHAVIORAL STATES (Relative body-length/s boundaries)
+            spd_bl_clean = tdf['speed_bl'].fillna(50.0 / body_length_cm).values
+            tdf['freezing_bl'] = (spd_bl_clean < f_thr_bl).astype(int)
+            tdf['swimming_bl'] = ((spd_bl_clean >= f_thr_bl) & (spd_bl_clean < r_thr_bl)).astype(int)
+            tdf['rapid_bl'] = (spd_bl_clean >= r_thr_bl).astype(int)
 
             # 3. SPATIAL POSITIONING (Calculated dynamically from ROI parameters)
             set_val = arena_settings.get(i, arena_settings.get(str(i), {'cx_pct':50.0, 'cy_pct':50.0}))
@@ -110,10 +124,18 @@ class AnalysisEngine:
                 is_first = tdf.groupby(id_col).cumcount() == 0
                 tdf.loc[is_first, 'swimming'] = 1
                 tdf.loc[is_first, ['freezing', 'rapid']] = 0
+                
+                # Apply initialization adjustments to BL indices as well
+                tdf.loc[is_first, 'swimming_bl'] = 1
+                tdf.loc[is_first, ['freezing_bl', 'rapid_bl']] = 0
             else:
                 tdf['prev_x'], tdf['prev_y'] = tdf['X'].shift(1), tdf['Y'].shift(1)
                 tdf.loc[tdf.index[0], 'swimming'] = 1
                 tdf.loc[tdf.index[0], ['freezing', 'rapid']] = 0
+                
+                # Apply initialization adjustments to BL indices as well
+                tdf.loc[tdf.index[0], 'swimming_bl'] = 1
+                tdf.loc[tdf.index[0], ['freezing_bl', 'rapid_bl']] = 0
 
             tdf['is_top'] = (tdf['prev_x'] < x_dot).astype(int)
             tdf['thigmo'] = np.sqrt((tdf['prev_x']-x_dot)**2 + (tdf['prev_y']-y_dot)**2) / px_per_cm
@@ -128,7 +150,7 @@ class AnalysisEngine:
                 for _, sub_df in tdf.groupby(id_col):
                     dr_global = sub_df['dr'].values
                     
-                    # A. Fractal Dimension on globally pre-calculated displacement array (keeps 0.0 values)
+                    # A. Fractal Dimension on globally pre-calculated displacement array
                     fd_slices = []
                     for start_idx in range(0, len(dr_global), slice_size):
                         slice_dr = dr_global[start_idx : start_idx + slice_size]
@@ -151,7 +173,7 @@ class AnalysisEngine:
             else:
                 dr_global = tdf['dr'].values
                 
-                # A. Fractal Dimension on globally pre-calculated displacement array (keeps 0.0 values)
+                # A. Fractal Dimension on globally pre-calculated displacement array
                 fd_slices = []
                 for start_idx in range(0, len(dr_global), slice_size):
                     slice_dr = dr_global[start_idx : start_idx + slice_size]
@@ -185,6 +207,15 @@ class AnalysisEngine:
             bot_pct = round(100.0 - top_pct, 3)
             bot_pct = max(0.0, bot_pct)
 
+            # Calculate ratio endpoints using Body Length / second groupings
+            valid_frames_bl = int(tdf['freezing_bl'].sum() + tdf['swimming_bl'].sum() + tdf['rapid_bl'].sum())
+            valid_frames_bl = valid_frames_bl if valid_frames_bl > 0 else 1
+
+            frz_bl_pct = round((tdf['freezing_bl'].sum() / valid_frames_bl) * 100, 3)
+            swm_bl_pct = round((tdf['swimming_bl'].sum() / valid_frames_bl) * 100, 3)
+            rap_bl_pct = round(100.0 - (frz_bl_pct + swm_bl_pct), 3)
+            rap_bl_pct = max(0.0, rap_bl_pct)
+
             results_summary.append({
                 "Arena_ID": int(arena_id),
                 "Average Speed (cm/s)": round(np.nanmean(tdf['speed'].values), 3),
@@ -195,11 +226,19 @@ class AnalysisEngine:
                 "Time in Bottom Percentage (%)": bot_pct,
                 "Average Thigmotaxis (cm)": round(np.nanmean(tdf['thigmo'].values), 3),
                 "Fractal Dimension": round(np.mean(fd_list), 3) if fd_list else 1.000,
-                "Entropy": round(np.mean(ent_list), 3) if ent_list else 1.009
+                "Entropy": round(np.mean(ent_list), 3) if ent_list else 1.009,
+                
+                # New Body-Length Scaled Endpoints using body-length/s
+                "Average Speed (body-length/s)": round(np.nanmean(tdf['speed_bl'].values), 3),
+                "Freezing Time Ratio (body-length/s) (%)": frz_bl_pct,
+                "Swimming Time Ratio (body-length/s) (%)": swm_bl_pct,
+                "Rapid movement time ratio (body-length/s) (%)": rap_bl_pct
             })
 
-            tdf['Arena_ID'] = arena_id
-            raw_kinetics.append(tdf)
+            # Check if we should compile high-frequency frame coordinates
+            if export_kinetics:
+                tdf['Arena_ID'] = arena_id
+                raw_kinetics.append(tdf)
 
         return results_summary, pd.concat(raw_kinetics) if raw_kinetics else pd.DataFrame()
 
@@ -280,7 +319,6 @@ class AnalysisEngine:
             if np.sum(valid_mask) < 2: return 1.000
 
             slope, _, _, _, _ = linregress(x_window[valid_mask], y_window[valid_mask])
-            # CLIP REMOVED to align with Excel outputting values below 1.0 (e.g. 0.147)
             return float(slope)
         except:
             return 1.000
